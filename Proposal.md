@@ -38,6 +38,6 @@ We want to take in a long form video with a group of people throughout and outpu
 
 ## 5. What is the potential positive impact to society your project may enable?
 
-This task allows for better sharing of sensitive data in a way that makes it easier to digest. Better communication of science that involves protected human data.
+This task will allow better sharing of sensitive data in a way that makes it easier to digest, allowing for better communication of science that involves protected human data.
 
-A relevant research project requires one to identify which children are performing which actions in order to build a profile of how individual children are acting and reacting to teaching. To enable both automated assigning of actions to unique person labels and IRB compliant anonymization while preserving unique visual identifiers.
+A relevant research project requires one to identify in classroom videos which children are performing which actions in order to build a profile of how individual children are acting and reacting to teaching. Such an anonymized video will enable both automated assigning of actions to unique person labels and IRB compliance while preserving unique visual identifiers.
