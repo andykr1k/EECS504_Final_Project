@@ -13,6 +13,7 @@ import requests
 from transformers import Sam3VideoModel, Sam3VideoProcessor
 from accelerate import Accelerator
 import torch
+import matplotlib.pyplot as plt
 
 # Load model and processor
 if torch.backends.mps.is_available():
@@ -21,32 +22,41 @@ elif torch.cuda.is_available():
     device = "cuda"
 else:
     device = "cpu"
+print(f"Using device: {device}")
 
-# model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-# # model = from_pretrained("facebook/sam3").to(device)
-# processor = Sam3Processor.from_pretrained("facebook/sam3")
+model = Sam3Model.from_pretrained("facebook/sam3").to(device)
+processor = Sam3Processor.from_pretrained("facebook/sam3")
 
-# cat_url = "http://images.cocodataset.org/val2017/000000077595.jpg"
-# kitchen_url = "http://images.cocodataset.org/val2017/000000136466.jpg"
-# images = [
-#     Image.open(requests.get(cat_url, stream=True).raw).convert("RGB"),
-#     Image.open(requests.get(kitchen_url, stream=True).raw).convert("RGB")
-# ]
+cat_url = "http://images.cocodataset.org/val2017/000000077595.jpg"
+kitchen_url = "http://images.cocodataset.org/val2017/000000136466.jpg"
+images = [
+    Image.open(requests.get(cat_url, stream=True).raw).convert("RGB"),
+    Image.open(requests.get(kitchen_url, stream=True).raw).convert("RGB")
+]
 
-# text_prompts = ["ear", "dial"]
+text_prompts = ["cat", "pot"]
 
-# inputs = processor(images=images, text=text_prompts, return_tensors="pt").to(device)
+inputs = processor(images=images, text=text_prompts, return_tensors="pt").to(device)
 
-# with torch.no_grad():
-#     outputs = model(**inputs)
+with torch.no_grad():
+    outputs = model(**inputs)
 
-# # Post-process results for both images
-# results = processor.post_process_instance_segmentation(
-#     outputs,
-#     threshold=0.5,
-#     mask_threshold=0.5,
-#     target_sizes=inputs.get("original_sizes").tolist()
-# )
+# Post-process results for both images
+results = processor.post_process_instance_segmentation(
+    outputs,
+    threshold=0.5,
+    mask_threshold=0.5,
+    target_sizes=inputs.get("original_sizes").tolist()
+)
 
-# print(f"Image 1: {len(results[0]['masks'])} objects found")
-# print(f"Image 2: {len(results[1]['masks'])} objects found")
+print(f"Image 1: {len(results[0]['masks'])} objects found")
+print(f"Image 2: {len(results[1]['masks'])} objects found")
+
+# Plot the results
+fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+for i, ax in enumerate(axes):
+    ax.imshow(images[i])
+    ax.axis("off")
+    for mask in results[i]["masks"]:
+        ax.imshow(mask.cpu(), alpha=0.5)
+fig.savefig("sam3_test.png")
