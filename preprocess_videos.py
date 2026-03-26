@@ -17,7 +17,8 @@ import yaml
 class Config:
     enabled: bool
     sam_prompt: str
-    skip_frames: int
+    sam_skip_frames: int
+    save_skip_frames: int
     max_scene_len_frames: int
 
 def split_video(config: Config, input_video_path: Path, out_dir_path: Path):

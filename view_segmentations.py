@@ -2,12 +2,18 @@ import streamlit as st
 import numpy as np
 import cv2
 import json
+import torch
 from pathlib import Path
 from PIL import Image
 
 # -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
+@st.cache_resource
+def get_dino_harness():
+    import dino_lib
+    return dino_lib.DinoHarness()
+
 @st.cache_data
 def get_segmentation_dirs(base_path: str):
     """Finds all directories ending with '_segmentations'."""
@@ -46,7 +52,7 @@ def get_color_for_id(person_id: int):
     np.random.seed(person_id)
     return np.random.randint(0, 255, size=3).tolist()
 
-def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5):
+def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5, use_dino: bool = False, dino_harness = None):
     """Loads the image and mask, and blends them together."""
     # Load Image
     img = cv2.imread(str(image_path))
@@ -72,6 +78,47 @@ def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5)
         color = get_color_for_id(uid)
         overlay[segmentation == uid] = color
         
+    if use_dino and dino_harness is not None:
+        image_pil = Image.fromarray(img)
+        with torch.no_grad():
+            d_segs = dino_harness.match_segmentations_to_dino([image_pil], [segmentation])
+            
+        for seg in d_segs[0]:
+            if not seg.dino_embeddings:
+                continue
+                
+            uid = seg.person_id
+            embeddings = torch.stack(seg.dino_embeddings)
+            
+            # Center embeddings
+            mean = embeddings.mean(dim=0, keepdim=True)
+            centered = embeddings - mean
+            
+            q = min(3, centered.shape[0])
+            if q > 0:
+                U, S, V = torch.pca_lowrank(centered, q=q)
+                reduced = torch.matmul(centered, V)
+                
+                if q < 3:
+                    padding = torch.zeros(reduced.shape[0], 3 - q, device=reduced.device)
+                    reduced = torch.cat([reduced, padding], dim=-1)
+                    
+                min_vals = reduced.min(dim=0, keepdim=True)[0]
+                max_vals = reduced.max(dim=0, keepdim=True)[0]
+                
+                ranges = max_vals - min_vals
+                ranges[ranges == 0] = 1.0 # prevent division by zero
+                
+                normalized = (reduced - min_vals) / ranges
+                colors = (normalized * 255.0).to(torch.uint8).cpu().numpy()
+                
+                for bbox, color in zip(seg.dino_bboxes, colors):
+                    x1, y1, x2, y2 = bbox
+                    box_mask = np.zeros_like(segmentation, dtype=bool)
+                    box_mask[y1:y2, x1:x2] = True
+                    final_mask = (segmentation == uid) & box_mask
+                    overlay[final_mask] = color.tolist()
+
     # Create mask of where segmentation exists to only blend those areas
     mask_exists = segmentation != -1
     
@@ -133,6 +180,9 @@ selected_frame_idx = st.sidebar.select_slider(
     value=frame_indices[0]
 )
 
+use_dino_pca = st.sidebar.checkbox("Visualize DINO Embeddings (PCA)", value=False)
+dino_harness = get_dino_harness() if use_dino_pca else None
+
 # Overlay opacity control
 alpha = st.sidebar.slider("Mask Opacity", min_value=0.0, max_value=1.0, value=0.6, step=0.1)
 
@@ -154,7 +204,7 @@ if not (frame_path.exists() and seg_path.exists() and sidecar_path.exists()):
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    blended_img = overlay_masks(frame_path, seg_path, alpha=alpha)
+    blended_img = overlay_masks(frame_path, seg_path, alpha=alpha, use_dino=use_dino_pca, dino_harness=dino_harness)
     st.image(blended_img, caption=f"Frame {selected_frame_idx} with Segmentation Masks", width="stretch")#, use_column_width=True)
 
 with col2:

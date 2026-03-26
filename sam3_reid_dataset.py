@@ -7,20 +7,26 @@ import json
 from pathlib import Path
 import random
 import logging
+import dino_lib
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 class Sam3ReIDDataset(Dataset):
-    def __init__(self, root_dir: str | Path, transform=None, mask_background=True):
+    def __init__(self, root_dir: str | Path, transform=None, mask_background=True, return_dino_segmentations=False):
         """
         Args:
             root_dir: The root directory to search for '*_segmentations' folders.
             transform: torchvision transforms to apply to the cropped person images.
             mask_background: If True, sets background pixels to black using the SAM mask.
+            return_dino_segmentations: If True, uses dino_lib to extract DINOv3 segmentations.
         """
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.mask_background = mask_background
+        self.return_dino_segmentations = return_dino_segmentations
+        
+        if self.return_dino_segmentations:
+            self.dino_harness = dino_lib.DinoHarness()
         
         # Flat list for __getitem__: [(frame_path, mask_path, person_id, global_class_id)]
         self.samples = []
@@ -111,7 +117,8 @@ class Sam3ReIDDataset(Dataset):
         frame_path, mask_path, person_id, class_id = self.samples[idx]
         
         # 1. Load image and mask
-        image = np.array(Image.open(frame_path).convert("RGB"))
+        image_pil = Image.open(frame_path).convert("RGB")
+        image = np.array(image_pil)
         mask_data = np.load(mask_path)['segmentation']
         
         # 2. Extract boolean mask for this specific person
@@ -137,6 +144,18 @@ class Sam3ReIDDataset(Dataset):
         if self.transform:
             crop_pil = self.transform(crop_pil)
             
+        if self.return_dino_segmentations:
+            with torch.no_grad():
+                dino_segs = self.dino_harness.match_segmentations_to_dino([image_pil], [mask_data])
+            dino_bboxes, dino_embeddings, dino_overlaps = [], [], []
+            for seg in dino_segs[0]:
+                if seg.person_id == person_id:
+                    dino_bboxes = seg.seg_bboxes if hasattr(seg, 'seg_bboxes') else seg.dino_bboxes
+                    dino_embeddings = seg.dino_embeddings
+                    dino_overlaps = seg.dino_overlaps
+                    break
+            return crop_pil, class_id, dino_bboxes, dino_embeddings, dino_overlaps
+
         return crop_pil, class_id
 
 

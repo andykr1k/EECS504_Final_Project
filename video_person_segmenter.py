@@ -103,13 +103,16 @@ class Sam3VideoPersonSegmenter:
             frame_boxes = frame_outputs["boxes"]
             frame_masks = frame_outputs["masks"]
             for j in range(len(frame_obj_ids)):
+                score = float(frame_scores[j])
+                if score < min_frame_confidence:
+                    continue
                 obj_id = int(frame_obj_ids[j])
                 if obj_id not in object_data:
                     object_data[obj_id] = []
                 
                 object_frame_data = {
                     "frame_idx": int(frame_idx),
-                    "score": float(frame_scores[j]),
+                    "score": score,
                     "box": [int(x) for x in frame_boxes[j]],
                     "mask": frame_masks[j].cpu().numpy(),
                 }
@@ -121,6 +124,10 @@ class Sam3VideoPersonSegmenter:
         for obj_id, obj_data in object_data.items():
             # Collect proportion of frames visible, average score, average mask ratio
             visible_frames = len(obj_data)
+            if visible_frames == 0:
+                del object_data[obj_id]
+                continue
+
             proportion_visible = visible_frames / total_frames
             avg_score = sum([frame_data["score"] for frame_data in obj_data]) / visible_frames
             avg_mask_ratio = sum([frame_data["mask"].sum() for frame_data in obj_data]) / (visible_frames * total_pixels)
@@ -220,7 +227,8 @@ class Sam3VideoPersonSegmenter:
 class Config:
     enabled: bool
     sam_prompt: str
-    skip_frames: int
+    sam_skip_frames: int
+    save_skip_frames: int
     max_scene_len_frames: int
 
 def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmenter, video_slice_path: Path | str, out_dir: Path | str):
@@ -231,7 +239,7 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
     obj_data, obj_summary_data, video_frames, frame_indices = video_segmenter.segment_video(
         video_slice_path,
         prompt=config.sam_prompt,
-        skip_frames=config.skip_frames,
+        skip_frames=config.sam_skip_frames,
         top_n=1000
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -261,6 +269,7 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
             where_mask = np.where(mask)
             frame_segmentations[frame_idx][where_mask] = obj_id
 
+    last_saved_frame_idx = -float('inf')
     for i in range(len(frame_indices)):
         frame_idx = frame_indices[i]
         frame = video_frames[i]
@@ -272,13 +281,20 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
             print(f"No people detected in frame {frame_idx}")
             continue
 
+        # Skip if it's too close to the last saved frame
+        if frame_idx - last_saved_frame_idx < config.save_skip_frames:
+            continue
+
         frame_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_frame.png"
         sidecar_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_sidecar.json"
         segmentation_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_segmentation.npz"
 
         cv2.imwrite(str(frame_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        json.dump(sidecar, open(sidecar_path, "w"))
+        with open(sidecar_path, "w") as f:
+            json.dump(sidecar, f)
         np.savez_compressed(str(segmentation_path), segmentation=segmentation)
+
+        last_saved_frame_idx = frame_idx
 
 def segment_preprocessed_video(config: Config, video_segmenter: Sam3VideoPersonSegmenter, processed_video_path: Path | str, out_dir: Path | str):
     print(f"Segmenting preprocessed video {processed_video_path}...")
@@ -304,6 +320,7 @@ def main(parent_dir: Path | str):
         config_path = dir_path / "config.yaml"
         assert config_path.exists(), f"Config not found at {config_path}"
         config = Config(**yaml.safe_load(config_path.read_text()))
+        print(f"Config: {config}")
 
         if not config.enabled:
             print(f"Skipping {dir_path} (disabled)")
