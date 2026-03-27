@@ -1,6 +1,7 @@
 import torch
-from torch.utils.data import Dataset, Sampler, DataLoader
-import torchvision.transforms as T
+from torch.utils.data import Dataset, Sampler, DataLoader, default_collate
+import torchvision.transforms.v2 as v2
+from torchvision import tv_tensors
 from PIL import Image
 import numpy as np
 import json
@@ -8,25 +9,21 @@ from pathlib import Path
 import random
 import logging
 import dino_lib
+import torchvision.transforms.functional as F
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 class Sam3ReIDDataset(Dataset):
-    def __init__(self, root_dir: str | Path, transform=None, mask_background=True, return_dino_segmentations=False):
+    def __init__(self, root_dir: str | Path, transform=None, mask_background=True):
         """
         Args:
             root_dir: The root directory to search for '*_segmentations' folders.
             transform: torchvision transforms to apply to the cropped person images.
             mask_background: If True, sets background pixels to black using the SAM mask.
-            return_dino_segmentations: If True, uses dino_lib to extract DINOv3 segmentations.
         """
         self.root_dir = Path(root_dir)
         self.transform = transform
         self.mask_background = mask_background
-        self.return_dino_segmentations = return_dino_segmentations
-        
-        if self.return_dino_segmentations:
-            self.dino_harness = dino_lib.DinoHarness()
         
         # Flat list for __getitem__: [(frame_path, mask_path, person_id, global_class_id)]
         self.samples = []
@@ -113,50 +110,117 @@ class Sam3ReIDDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        frame_path, mask_path, person_id, class_id = self.samples[idx]
+    def __getitem__(self, index):
+        frame_path, mask_path, person_id, class_id = self.samples[index]
         
-        # 1. Load image and mask
+        # 1. Extract image logic locally to exploit num_workers
         image_pil = Image.open(frame_path).convert("RGB")
-        image = np.array(image_pil)
-        mask_data = np.load(mask_path)['segmentation']
+        image_np = np.array(image_pil)
         
-        # 2. Extract boolean mask for this specific person
+        # 2. Fix np.load Memory Leak using a context manager
+        with np.load(mask_path) as data:
+            mask_data = data['segmentation']
+            
         person_mask = (mask_data == person_id)
         
-        # 3. Find bounding box to crop
-        coords = np.argwhere(person_mask)
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1  # +1 for slicing
-        
-        # 4. Apply mask to background (Optional but highly recommended for Re-ID)
+        # 3. Optimize NumPy Masking using fast vectorized broadcasting
         if self.mask_background:
-            # Create a black background image, then copy only the masked pixels over
-            masked_image = np.zeros_like(image)
-            masked_image[person_mask] = image[person_mask]
-            crop = masked_image[y0:y1, x0:x1]
+            out_img = image_np * person_mask[..., None]
         else:
-            # Just take the bounding box crop
-            crop = image[y0:y1, x0:x1]
+            out_img = image_np
             
-        crop_pil = Image.fromarray(crop)
+        out_pil = Image.fromarray(out_img)
         
+        # 4. Perfectly align spatial transformations for both image and mask
         if self.transform:
-            crop_pil = self.transform(crop_pil)
+            mask_tensor = tv_tensors.Mask(torch.from_numpy(person_mask))
+            out_img_transformed, out_mask_transformed = self.transform(out_pil, mask_tensor)
+        else:
+            out_img_transformed = F.to_tensor(out_pil)
+            out_mask_transformed = person_mask
             
-        if self.return_dino_segmentations:
-            with torch.no_grad():
-                dino_segs = self.dino_harness.match_segmentations_to_dino([image_pil], [mask_data])
-            dino_bboxes, dino_embeddings, dino_overlaps = [], [], []
-            for seg in dino_segs[0]:
-                if seg.person_id == person_id:
-                    dino_bboxes = seg.seg_bboxes if hasattr(seg, 'seg_bboxes') else seg.dino_bboxes
-                    dino_embeddings = seg.dino_embeddings
-                    dino_overlaps = seg.dino_overlaps
-                    break
-            return crop_pil, class_id, dino_bboxes, dino_embeddings, dino_overlaps
+        return frame_path, mask_path, person_id, class_id, image_pil, mask_data, out_img_transformed, out_mask_transformed
 
-        return crop_pil, class_id
+def reid_collate_fn(batch):
+    frame_paths = [item[0] for item in batch]
+    mask_paths = [item[1] for item in batch]
+    person_ids = [item[2] for item in batch]
+    labels = default_collate([item[3] for item in batch])
+    
+    original_images = [item[4] for item in batch]
+    original_masks = [item[5] for item in batch]
+
+    transformed_images = [item[6] for item in batch]
+    transformed_masks = [item[7] for item in batch]
+    
+    return frame_paths, mask_paths, person_ids, labels, original_images, original_masks, transformed_images, transformed_masks
+
+class DinoDataLoaderWrapper:
+    """
+    Wraps a torch DataLoader to compute DINO embeddings in batches.
+    Requires use of reid_collate_fn in the underlying DataLoader.
+    """
+    def __init__(self, dataloader, dino_harness=None, device="cuda"):
+        self.dataloader = dataloader
+        self.dino_harness = dino_harness
+        self.device = device
+        self._dino_initialized = False
+
+    def _init_dino(self):
+        if not self._dino_initialized:
+            if self.dino_harness is None:
+                import dino_lib
+                self.dino_harness = dino_lib.DinoHarness(device=self.device)
+            self._dino_initialized = True
+
+    def __iter__(self):
+        self._init_dino()
+        for batch in self.dataloader:
+            frame_paths, mask_paths, person_ids, labels, original_images, original_masks, images, masks = batch
+            
+            # Extract unique frames from the batch for DINO
+            unique_frames = {}
+            for f_path, orig_img, orig_mask in zip(frame_paths, original_images, original_masks):
+                if str(f_path) not in unique_frames:
+                    unique_frames[str(f_path)] = (orig_img, orig_mask)
+            
+            unique_f_paths = list(unique_frames.keys())
+            u_images = [unique_frames[p][0] for p in unique_f_paths]
+            u_masks = [unique_frames[p][1] for p in unique_f_paths]
+            
+            with torch.no_grad():
+                assert self.dino_harness is not None
+                print("Dino running")
+                u_dino_segs = self.dino_harness.match_segmentations_to_dino(u_images, u_masks)
+                print("Dino finished")
+            
+            dino_segs_by_path = {p: segs for p, segs in zip(unique_f_paths, u_dino_segs)}
+            
+            batch_bboxes = []
+            batch_embeddings = []
+            batch_overlaps = []
+            
+            batch_size = len(labels)
+            for i in range(batch_size):
+                f_path = str(frame_paths[i])
+                p_id = person_ids[i]
+                dino_segs = dino_segs_by_path[f_path]
+                
+                b_bboxes, b_embeddings, b_overlaps = [], [], []
+                for seg in dino_segs:
+                    if seg.person_id == p_id:
+                        b_bboxes = seg.seg_bboxes if hasattr(seg, 'seg_bboxes') else seg.dino_bboxes
+                        b_embeddings = seg.dino_embeddings
+                        b_overlaps = seg.dino_overlaps
+                        break
+                batch_bboxes.append(b_bboxes)
+                batch_embeddings.append(b_embeddings)
+                batch_overlaps.append(b_overlaps)
+            
+            yield images, labels, masks, batch_bboxes, batch_embeddings, batch_overlaps
+
+    def __len__(self):
+        return len(self.dataloader)
 
 
 class VideoSlicePKBatchSampler(Sampler):
@@ -228,12 +292,13 @@ class VideoSlicePKBatchSampler(Sampler):
         return self.num_batches
 
 if __name__ == "__main__":
-    # 1. Define typical Re-ID transformations (resize, random flip, normalize)
-    transform = T.Compose([
-        T.Resize((256, 128)), # Standard ReID aspect ratio
-        T.RandomHorizontalFlip(),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    # 1. Define typical Re-ID transformations
+    # Using torchvision.transforms.v2 to sync spatial transforms across image and mask
+    transform = v2.Compose([
+        v2.RandomHorizontalFlip(),
+        v2.ToImage(),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     # 2. Instantiate the Dataset (Preprocessing / file searching happens here)
@@ -256,19 +321,34 @@ if __name__ == "__main__":
     )
 
     # 5. Create the Dataloader
+    # Note: reid_collate_fn handles fallback if PIL images/arrays cannot be default stacked.
     dataloader = DataLoader(
         dataset,
         batch_sampler=sampler,
-        num_workers=4,
-        pin_memory=True
+        num_workers=0,
+        pin_memory=True,
+        collate_fn=reid_collate_fn
     )
 
+    dino_dataloader = DinoDataLoaderWrapper(dataloader)
+
     # Iterate
-    for batch_idx, (images, labels) in enumerate(dataloader):
-        # images shape: [64, 3, 256, 128]
+    for batch_idx, (images, labels, masks, batch_bboxes, batch_embeddings, batch_overlaps) in enumerate(dino_dataloader):
+        # images shape: [64, 3, height, width] based on transform/original
         # labels shape: [64] -> e.g., [id1, id1, id1, id1, id2, id2, id2, id2, ...]
         
         # Pass to model and Circle Loss...
-        print(images.shape)
+        print(len(images), images[0].shape)
         print(labels.shape)
+        print(len(masks), masks[0].shape)
         break
+
+    # Sample batches as fast as possible to test the speed
+    import time
+    from tqdm import tqdm
+    sample_test_len_s = 120
+    start_time = time.time()
+    for batch_idx, (images, labels, masks, batch_bboxes, batch_embeddings, batch_overlaps) in enumerate(tqdm(dino_dataloader)):
+        if time.time() - start_time > sample_test_len_s:
+            break
+    print(f"Sampled {batch_idx + 1} batches in {time.time() - start_time} seconds. {batch_idx / (time.time() - start_time)} batches/second")
