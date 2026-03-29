@@ -1,11 +1,13 @@
+import cv2
 import streamlit as st
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
+from torchvision.transforms import v2
 
 # Import your updated components
 # (Ensure the import paths match where your classes actually live)
-from sam3_reid_dataset_v2 import (
+from sam3_reid_dataset import (
     Sam3ReIDDataset, 
     VideoSlicePKBatchSampler, 
     reid_collate_fn, 
@@ -27,18 +29,34 @@ K = st.sidebar.number_input("K (Instances per identity)", min_value=2, max_value
 
 # --- Caching the Dataset ---
 @st.cache_resource(show_spinner="Scanning dataset directory...")
-def load_dataset(root_dir):
+def load_dataset(root_dir, use_transforms=False):
     # We pass transform=None to keep images as standard [0, 1] float tensors 
     # without ImageNet normalization, so they render accurately in Streamlit.
+    transform = v2.Compose([
+        # --- 1. Safe Spatial Transforms ---
+        v2.RandomHorizontalFlip(p=0.5),
+        
+        # Slight rotation (±5 degrees), translation (±5%), and scaling (95% to 105%)
+        # The mask will perfectly track with these changes.
+        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+
+        # --- 2. Color and Lighting (Photometric) ---
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        v2.RandomGrayscale(p=0.1),
+        
+        # Randomly apply Gaussian Blur to 10% of images to simulate poor focus
+        v2.RandomApply([v2.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.0))], p=0.1),
+    ])
     dataset = Sam3ReIDDataset(
         root_dir=root_dir,
-        transform=None 
+        transform=transform if use_transforms else None 
     )
     return dataset
 
 # --- Main App Logic ---
 try:
-    dataset = load_dataset(data_dir)
+    use_transforms = st.sidebar.checkbox("Use Random Transforms", value=True)
+    dataset = load_dataset(data_dir, use_transforms=use_transforms)
     st.sidebar.success(f"Loaded {len(dataset)} bounding boxes!")
 except Exception as e:
     st.error(f"Failed to load dataset: {e}")

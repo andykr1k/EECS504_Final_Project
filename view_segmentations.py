@@ -12,7 +12,7 @@ from PIL import Image
 @st.cache_resource
 def get_dino_harness():
     import dino_lib
-    return dino_lib.OptimizedDinoHarness()
+    return dino_lib.DinoHarness()
 
 @st.cache_data
 def get_segmentation_dirs(base_path: str):
