@@ -12,7 +12,7 @@ from PIL import Image
 @st.cache_resource
 def get_dino_harness():
     import dino_lib
-    return dino_lib.DinoHarness()
+    return dino_lib.OptimizedDinoHarness()
 
 @st.cache_data
 def get_segmentation_dirs(base_path: str):
@@ -84,11 +84,11 @@ def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5,
             d_segs = dino_harness.match_segmentations_to_dino([image_pil], [segmentation])
             
         for seg in d_segs[0]:
-            if not seg.dino_embeddings:
+            if len(seg.dino_embeddings) == 0:
                 continue
                 
             uid = seg.person_id
-            embeddings = torch.stack(seg.dino_embeddings)
+            embeddings = seg.dino_embeddings
             
             # Center embeddings
             mean = embeddings.mean(dim=0, keepdim=True)

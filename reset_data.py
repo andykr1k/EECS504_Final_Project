@@ -80,56 +80,9 @@ def main(input_dir: Path | str, remove_segmentations: bool, remove_preprocessed_
 
 if __name__ == "__main__":
     remove_segmentations = True
-    remove_preprocessed_slices = True
+    remove_preprocessed_slices = False
 
     use_parallel = True
     dry_run = False
     
     main("/z/dat/person_reid/internal/input_videos", remove_segmentations, remove_preprocessed_slices, use_parallel, dry_run)
-
-# """
-# Crawls the input video directory and removes segmentations and preprocessed slices.
-# """
-
-# from pathlib import Path
-# import subprocess
-# import shutil
-
-# def remove_directory(directory: Path | str, use_rsync: bool = True, dry_run: bool = False):
-#     print(f"Removing directory: {directory}")
-#     if use_rsync:
-#         tmp_empty_dir_path = Path("/tmp/empty_dir_for_rsync")
-#         tmp_empty_dir_path.mkdir(exist_ok=True)
-#         command = ["rsync", "-a", "--delete", f"{str(tmp_empty_dir_path)}/", f"{str(directory)}/"]
-#         print(f"  Running: {' '.join(command)}")
-#         if not dry_run:
-#             subprocess.run(command, check=True)
-#         print(f"  Removing: {tmp_empty_dir_path}")
-#         tmp_empty_dir_path.rmdir()
-#         print("  Done")
-#     else:
-#         print(f"  Running: shutil.rmtree({directory})")
-#         if not dry_run:
-#             shutil.rmtree(directory)
-#         print("  Done")
-
-# def main(input_dir: Path | str, remove_segmentations: bool, remove_preprocessed_slices: bool, use_rsync: bool = True, dry_run: bool = False):
-#     if remove_preprocessed_slices:
-#         # Then we look for all descendents of the input dir that end with "_processed"
-#         for processed_dir_path in Path(input_dir).rglob("*_processed"):
-#             remove_directory(processed_dir_path, use_rsync, dry_run)
-
-#     if remove_segmentations:
-#         # Then we look for all descendents of the input dir that end with "_segmentations"
-#         for segmentations_dir_path in Path(input_dir).rglob("*_segmentations"):
-#             remove_directory(segmentations_dir_path, use_rsync, dry_run)
-
-
-
-# if __name__ == "__main__":
-#     remove_segmentations = True
-#     remove_preprocessed_slices = False
-
-#     use_rsync = True
-#     dry_run = True
-#     main("/z/dat/person_reid/internal/input_videos", remove_segmentations, remove_preprocessed_slices, use_rsync, dry_run)

@@ -63,7 +63,7 @@ class Sam3VideoPersonSegmenter:
 
     def segment_video(self, video_path: Path | str, prompt: str = "person", top_n: int = 10, 
                       min_confidence: float = 0.75, min_frame_confidence: float = 0.5,
-                      min_mask_ratio: float = 0.002, min_frames_visible: int = 10, 
+                      min_mask_ratio: float = 0.007, min_frames_visible: int = 10, min_frame_mask_ratio: float = 0.005,
                       max_num_frames: int | None = None, skip_frames: int = 1):
         video_path = Path(video_path)
 
@@ -96,6 +96,7 @@ class Sam3VideoPersonSegmenter:
 
         # Convert to a more easily usable format where each key is the object id and the value contains information about detections across all frames
         object_data = {}
+        total_pixels = video_frames[0].shape[0] * video_frames[0].shape[1]
         for i, frame_outputs in outputs_per_frame.items():
             frame_idx = frame_indices[i]
             frame_obj_ids = frame_outputs["object_ids"]
@@ -106,6 +107,11 @@ class Sam3VideoPersonSegmenter:
                 score = float(frame_scores[j])
                 if score < min_frame_confidence:
                     continue
+
+                mask_ratio = float(frame_masks[j].sum()) / total_pixels
+                if mask_ratio < min_frame_mask_ratio:
+                    continue
+
                 obj_id = int(frame_obj_ids[j])
                 if obj_id not in object_data:
                     object_data[obj_id] = []
@@ -120,7 +126,6 @@ class Sam3VideoPersonSegmenter:
 
         total_frames = len(outputs_per_frame)
         obj_summary_data = {}
-        total_pixels = video_frames[0].shape[0] * video_frames[0].shape[1]
         for obj_id, obj_data in object_data.items():
             # Collect proportion of frames visible, average score, average mask ratio
             visible_frames = len(obj_data)
