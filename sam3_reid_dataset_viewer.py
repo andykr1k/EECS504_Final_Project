@@ -28,10 +28,18 @@ P = st.sidebar.number_input("P (Identities per batch)", min_value=2, max_value=3
 K = st.sidebar.number_input("K (Instances per identity)", min_value=2, max_value=16, value=4)
 
 # --- Caching the Dataset ---
+# @st.cache_resource(show_spinner="Scanning dataset directory...")
+# def load_dataset(root_dir):
+#     # We pass transform=None to keep images as standard [0, 1] float tensors 
+#     # without ImageNet normalization, so they render accurately in Streamlit.
+#     dataset = Sam3ReIDDataset(
+#         root_dir=root_dir,
+#         transform=None 
+#     )
+#     return dataset
+
 @st.cache_resource(show_spinner="Scanning dataset directory...")
-def load_dataset(root_dir, use_transforms=False):
-    # We pass transform=None to keep images as standard [0, 1] float tensors 
-    # without ImageNet normalization, so they render accurately in Streamlit.
+def load_dataloader(root_dir, use_transforms=False, P=4, K=4):
     transform = v2.Compose([
         # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
@@ -49,48 +57,70 @@ def load_dataset(root_dir, use_transforms=False):
     ])
     dataset = Sam3ReIDDataset(
         root_dir=root_dir,
-        transform=transform if use_transforms else None 
+        target_size=(1080, 1920)
     )
-    return dataset
+
+    sampler = VideoSlicePKBatchSampler(
+        dataset, 
+        num_identities=P, 
+        instances_per_identity=K
+    )
+    
+    # 2. Initialize DataLoader
+    # num_workers=0 is necessary for Streamlit to prevent threading issues
+    dataloader = DataLoader(
+        dataset, 
+        batch_sampler=sampler, 
+        num_workers=0,
+        # collate_fn=reid_collate_fn
+    )
+    
+    # 3. Wrap with DINO DataLoader
+    # (Assuming DINO is available on CUDA, otherwise you may need device="cpu")
+    dino_dataloader = DinoDataLoaderWrapper(dataloader, transform=transform if use_transforms else None)
+
+    return dino_dataloader
+    
+
 
 # --- Main App Logic ---
 try:
     use_transforms = st.sidebar.checkbox("Use Random Transforms", value=True)
-    dataset = load_dataset(data_dir, use_transforms=use_transforms)
-    st.sidebar.success(f"Loaded {len(dataset)} bounding boxes!")
+    dino_dataloader = load_dataloader(data_dir, use_transforms=use_transforms, P=P, K=K)
+    st.sidebar.success(f"Loaded {len(dino_dataloader)} bounding boxes!")
 except Exception as e:
     st.error(f"Failed to load dataset: {e}")
     st.stop()
 
 if st.button("🎲 Sample New Batch", type="primary"):
     with st.spinner("Sampling and calculating DINO embeddings..."):
-        # 1. Initialize Sampler (Using updated kwargs)
-        sampler = VideoSlicePKBatchSampler(
-            dataset, 
-            num_identities=P, 
-            instances_per_identity=K
-        )
+        # # 1. Initialize Sampler (Using updated kwargs)
+        # sampler = VideoSlicePKBatchSampler(
+        #     dataset, 
+        #     num_identities=P, 
+        #     instances_per_identity=K
+        # )
         
-        # 2. Initialize DataLoader
-        # num_workers=0 is necessary for Streamlit to prevent threading issues
-        dataloader = DataLoader(
-            dataset, 
-            batch_sampler=sampler, 
-            num_workers=0,
-            collate_fn=reid_collate_fn
-        )
+        # # 2. Initialize DataLoader
+        # # num_workers=0 is necessary for Streamlit to prevent threading issues
+        # dataloader = DataLoader(
+        #     dataset, 
+        #     batch_sampler=sampler, 
+        #     num_workers=0,
+        #     # collate_fn=reid_collate_fn
+        # )
         
-        # 3. Wrap with DINO DataLoader
-        # (Assuming DINO is available on CUDA, otherwise you may need device="cpu")
-        dino_dataloader = DinoDataLoaderWrapper(dataloader)
+        # # 3. Wrap with DINO DataLoader
+        # # (Assuming DINO is available on CUDA, otherwise you may need device="cpu")
+        # dino_dataloader = DinoDataLoaderWrapper(dataloader)
         
         # 4. Grab the first batch
         # The new wrapper yields a dictionary rather than a tuple
         batch = next(iter(dino_dataloader))
         
-        batch_images = batch["images"]
-        batch_labels = batch["class_ids"]
-        batch_masks = batch["masks"]
+        batch_images = batch["image"]
+        batch_labels = batch["class_id"]
+        batch_masks = batch["mask"]
         batch_bboxes = batch["bboxes"]
         batch_embeddings = batch["embeddings"]
         

@@ -14,7 +14,7 @@ from torchvision.io import read_image
 from codetiming import Timer
 
 class Sam3ReIDDataset(Dataset):
-    def __init__(self, root_dir: str | Path, transform=None):
+    def __init__(self, root_dir: str | Path, transform=None, target_size=(1080, 1920)):
         """
         Args:
             root_dir: The root directory to search for '*_segmentations' folders.
@@ -22,6 +22,8 @@ class Sam3ReIDDataset(Dataset):
         """
         self.root_dir = Path(root_dir)
         self.transform = transform
+        self.target_size = target_size
+        self.resize_transform = v2.Resize(self.target_size, antialias=True)
 
         # Flat list for __getitem__: [(frame_path, mask_path, person_id, global_class_id)]
         self.samples = []
@@ -114,7 +116,6 @@ class Sam3ReIDDataset(Dataset):
         # Use torchvision to efficiently load the image
         with Timer("Read Image", text="Read Image: {:.4f} seconds", logger=None):
             image = read_image(str(frame_path))
-            image = F.convert_image_dtype(image, dtype=torch.float32)
             image_tensor = tv_tensors.Image(image)
         
         # Load the mask
@@ -125,34 +126,39 @@ class Sam3ReIDDataset(Dataset):
             # mask_tensor = tv_tensors.Mask(torchch.from_numpy(person_mask))
 
             # read_image reads 8-bit grayscale PNGs as a (1, H, W) uint8 tensor
-            mask_data = read_image(str(mask_path))
+            raw_mask_data = read_image(str(mask_path))
+            mask_data = raw_mask_data.squeeze(0)
             person_mask = (mask_data == person_idx)
-            person_mask = person_mask.squeeze(0)
             mask_tensor = tv_tensors.Mask(person_mask)
+
+        with Timer("Resize Image", text="Resize Image: {:.4f} seconds", logger=None):
+            image_tensor, mask_tensor = self.resize_transform(image_tensor, mask_tensor)
 
         # Apply the transforms to the image and mask
         if self.transform:
             with Timer("Apply Transforms", text="Apply Transforms: {:.4f} seconds", logger=None):
                 image_tensor, mask_tensor = self.transform(image_tensor, mask_tensor)
 
+        image_tensor = F.convert_image_dtype(image_tensor, dtype=torch.float32)
+
         return {
             "person_id": person_idx,
             "class_id": class_id,
-            "image": image_tensor,
-            "mask": mask_tensor
+            "image": image_tensor.contiguous(),
+            "mask": mask_tensor.contiguous()
         }
 
 def reid_collate_fn(batch):
     person_ids = default_collate([item["person_id"] for item in batch])
     class_ids = default_collate([item["class_id"] for item in batch])
-    images = [item["image"] for item in batch]
-    masks = [item["mask"] for item in batch]
+    images = default_collate([item["image"] for item in batch])
+    masks = default_collate([item["mask"] for item in batch])
 
     return {
-        "person_ids": person_ids,
-        "class_ids": class_ids,
-        "images": images,
-        "masks": masks
+        "person_id": person_ids,
+        "class_id": class_ids,
+        "image": images,
+        "mask": masks
     }
 
 class DinoDataLoaderWrapper:
@@ -164,12 +170,14 @@ class DinoDataLoaderWrapper:
     def __init__(
         self,
         dataloader,
+        transform=None,
         dino_harness=None,
         device="cuda",
         checkpoint="facebook/dinov3-vits16-pretrain-lvd1689m",
         max_side_len=1024,
     ):
         self.dataloader = dataloader
+        self.transform = transform
         self.dino_harness = dino_harness
         self.device = device
         self.checkpoint = checkpoint
@@ -185,10 +193,36 @@ class DinoDataLoaderWrapper:
     def __iter__(self):
         for batch in self.dataloader:
             # Convert the images to PIL to prepare to pass to DINO
-            with Timer("Convert images for DINO", text=f"Convert {len(batch['images'])} images for DINO:" + " {:.4f} seconds", logger=None):
-                images = batch["images"]
-                # masks = [mask.int() - 1 for mask in batch["masks"]]  # -1 so that background is -1 and person is 0 as match_segmentations_to_dino expects
-                masks = batch["masks"]
+            with Timer("Convert images for DINO", text=f"Convert {len(batch['image'])} images for DINO:" + " {:.4f} seconds", logger=None):
+                images = batch["image"]
+                masks = batch["mask"]
+
+            # if self.transform is not None:
+            #     with Timer("Apply Transforms", text="Apply Transforms: {:.4f} seconds", logger=None):
+            #         images = tv_tensors.Image(images).to(device=self.device)
+            #         masks = tv_tensors.Mask(masks).to(device=self.device)
+            #         images, masks = self.transform(images, masks)
+
+            if self.transform is not None:
+                with Timer("Apply Transforms", text="Apply Transforms: {:.4f} seconds", logger=None):
+                    # 1. Move the raw batch to the GPU
+                    images = tv_tensors.Image(images).to(device=self.device)
+                    masks = tv_tensors.Mask(masks).to(device=self.device)
+                    
+                    # 2. Iterate through the batch on the GPU to force independent random rolls
+                    transformed_images = []
+                    transformed_masks = []
+                    
+                    for img, mask in zip(images, masks):
+                        img = tv_tensors.Image(img)
+                        mask = tv_tensors.Mask(mask)
+                        t_img, t_mask = self.transform(img, mask)
+                        transformed_images.append(t_img)
+                        transformed_masks.append(t_mask)
+                    
+                    # 3. Stack them back into batched tensors
+                    images = torch.stack(transformed_images)
+                    masks = torch.stack(transformed_masks)
 
             with torch.no_grad():
                 assert self.dino_harness is not None
@@ -209,10 +243,10 @@ class DinoDataLoaderWrapper:
                     overlaps.append(dino_segmentation.dino_overlaps)
 
             yield {
-                "person_ids": batch["person_ids"],
-                "class_ids": batch["class_ids"],
-                "images": batch["images"],
-                "masks": batch["masks"],
+                "person_id": batch["person_id"],
+                "class_id": batch["class_id"],
+                "image": images,
+                "mask": masks,
                 # For these we cannot convert to tensors as each image has a different number of overlapping bboxes
                 "bboxes": bboxes,
                 "embeddings": embeddings,
@@ -286,10 +320,7 @@ class VideoSlicePKBatchSampler(Sampler):
                     for identity in identities_to_pull:
                         instances = slice_data[identity]
 
-                        # # Randomly sample K instances from the identity
-                        # batch.extend(random.sample(instances, self.K))
-                        # identities_in_batch += 1
-
+                        # We sample with enforced diversity by spacing out the samples over the entire video
                         N = len(instances)
                         spaced_samples = [
                             random.choice(instances[i * N // self.K : (i + 1) * N // self.K]) 
@@ -314,7 +345,7 @@ if __name__ == "__main__":
     # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
         
-        # Slight rotation (±5 degrees), translation (±5%), and scaling (95% to 105%)
+        # Slight rotation (5 degrees), translation (5%), and scaling (95% to 105%)
         # The mask will perfectly track with these changes.
         v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
 
@@ -329,8 +360,8 @@ if __name__ == "__main__":
     # 2. Instantiate the Dataset (Preprocessing / file searching happens here)
     dataset = Sam3ReIDDataset(
         root_dir="/z/dat/person_reid/internal/input_videos",
-        # root_dir="/scratch4/home/adempst/projects/EECS504_Final_Project/dataset/internal/input_videos",
-        transform=transform
+        transform=None,
+        target_size=(1080, 1920)
     )
 
     # 3. Setup PK parameters
@@ -355,13 +386,19 @@ if __name__ == "__main__":
         collate_fn=reid_collate_fn
     )
 
-    dino_dataloader = DinoDataLoaderWrapper(dataloader)
+    dino_dataloader = DinoDataLoaderWrapper(dataloader, transform=transform)
 
     # Iterate
     for batch_idx, batch in enumerate(dino_dataloader):
-        images = batch["images"]
-        labels = batch["class_ids"]
-        masks = batch["masks"]
+        images = batch["image"]
+        labels = batch["class_id"]
+        masks = batch["mask"]
+        embeddings = batch["embeddings"]
+
+        # Compute the average length of the embeddings and the std of the
+        embedding_lengths = [len(emb) for emb in embeddings]
+        print(f"Average embedding length: {np.mean(embedding_lengths)}")
+        print(f"Std of embedding lengths: {np.std(embedding_lengths)}")
         
         # Pass to model and Circle Loss...
         print(f"Images length: {len(images)}, First image shape: {images[0].shape}")
@@ -372,7 +409,7 @@ if __name__ == "__main__":
     # Sample batches as fast as possible to test the speed
     import time
     from tqdm import tqdm
-    sample_test_len_s = 60
+    sample_test_len_s = 300
     start_time = time.time()
     with Timer("Total", text="Total: {:.4f} seconds"):
         for batch_idx, batch in enumerate(tqdm(dino_dataloader)):
