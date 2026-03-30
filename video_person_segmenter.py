@@ -251,8 +251,8 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
 
     height, width = video_frames[0].shape[:2]
 
-    all_video_frames, _ = load_video(str(video_slice_path))
-    video_segmenter.render_masked_video(all_video_frames, obj_data, out_dir / f"{video_slice_path.stem}_segmented.mp4")
+    # all_video_frames, _ = load_video(str(video_slice_path))
+    # video_segmenter.render_masked_video(all_video_frames, obj_data, out_dir / f"{video_slice_path.stem}_segmented.mp4")
 
     frame_sidecars: dict[int, dict] = {}
     frame_segmentations: dict[int, np.ndarray] = {}
@@ -263,9 +263,16 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
             "visible_person_ids": []
         }
         frame_sidecars[frame_idx] = sidecar_data
-        frame_segmentations[frame_idx] = np.full((height, width), -1, dtype=np.int32)
+        # frame_segmentations[frame_idx] = np.full((height, width), -1, dtype=np.int32)
+        # Changing to masks as pngs
+        frame_segmentations[frame_idx] = np.full((height, width), 255, dtype=np.uint8)
+
 
     for obj_id, obj_datum in obj_data.items():
+        if obj_id >= 255:
+            print(f"Warning: obj_id {obj_id} exceeds uint8 limits. Skipping.")
+            continue
+
         for frame_data in obj_datum:
             frame_idx = frame_data["frame_idx"]
             frame_sidecars[frame_idx]["visible_person_ids"].append(obj_id)
@@ -292,12 +299,16 @@ def segment_video_slice(config: Config, video_segmenter: Sam3VideoPersonSegmente
 
         frame_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_frame.png"
         sidecar_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_sidecar.json"
-        segmentation_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_segmentation.npz"
+        # segmentation_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_segmentation.npz"
+        # Changing to masks as pngs
+        segmentation_path = out_dir / f"{video_slice_path.stem}_{frame_idx}_segmentation.png"
 
         cv2.imwrite(str(frame_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         with open(sidecar_path, "w") as f:
             json.dump(sidecar, f)
-        np.savez_compressed(str(segmentation_path), segmentation=segmentation)
+        # np.savez_compressed(str(segmentation_path), segmentation=segmentation)
+        # Changing to masks as pngs
+        cv2.imwrite(str(segmentation_path), segmentation)
 
         last_saved_frame_idx = frame_idx
 
@@ -308,6 +319,10 @@ def segment_preprocessed_video(config: Config, video_segmenter: Sam3VideoPersonS
 
     video_slices = processed_video_path.glob("*.mp4")
     for video_slice_path in video_slices:
+        if video_slice_path.stem.endswith("_debug"):
+            print(f"Skipping debug video {video_slice_path}")
+            continue
+
         out_imgs_dir = out_dir / video_slice_path.stem
         if out_imgs_dir.exists():
             print(f"Skipping {video_slice_path} (already processed)")

@@ -73,7 +73,9 @@ class Sam3ReIDDataset(Dataset):
                     total_frames += 1
 
                     frame_path = slice_dir / f"{slice_name}_{frame_idx}_frame.png"
-                    mask_path = slice_dir / f"{slice_name}_{frame_idx}_segmentation.npz"
+                    # mask_path = slice_dir / f"{slice_name}_{frame_idx}_segmentation.npz"
+                    # Changing to masks as pngs
+                    mask_path = slice_dir / f"{slice_name}_{frame_idx}_segmentation.png"
 
                     for person_idx in visible_ids:
                         # We use a unique identifier to define the positive set
@@ -117,10 +119,16 @@ class Sam3ReIDDataset(Dataset):
         
         # Load the mask
         with Timer("Load Mask", text="Load Mask: {:.4f} seconds", logger=None):
-            with np.load(mask_path) as data:
-                mask_data = data['segmentation']
+            # with np.load(mask_path) as data:
+            #     mask_data = data['segmentation']
+            # person_mask = (mask_data == person_idx)
+            # mask_tensor = tv_tensors.Mask(torchch.from_numpy(person_mask))
+
+            # read_image reads 8-bit grayscale PNGs as a (1, H, W) uint8 tensor
+            mask_data = read_image(str(mask_path))
             person_mask = (mask_data == person_idx)
-            mask_tensor = tv_tensors.Mask(torch.from_numpy(person_mask))
+            person_mask = person_mask.squeeze(0)
+            mask_tensor = tv_tensors.Mask(person_mask)
 
         # Apply the transforms to the image and mask
         if self.transform:
