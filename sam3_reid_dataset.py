@@ -230,7 +230,7 @@ class DinoDataLoaderWrapper:
                     dino_segmentations = self.dino_harness.match_bool_segmentations_to_dino(images, masks)
 
             with Timer("Process DINO Segmentations", text="Process DINO Segmentations: {:.4f} seconds", logger=None):
-                bboxes, embeddings, overlaps = [], [], []
+                person_ids, class_ids, bboxes, embeddings, overlaps = [], [], [], [], []
                 for batch_index, dino_segmentation in enumerate(dino_segmentations):
                     # The segmentations can include multiple objects, but we only use one so we expect there to only be one segmentation
                     if len(dino_segmentation) == 0:
@@ -238,13 +238,20 @@ class DinoDataLoaderWrapper:
                         continue
                     dino_segmentation = dino_segmentation[0]
 
+                    person_id = batch["person_id"][batch_index]
+                    class_id = batch["class_id"][batch_index]
+
+                    person_ids.append(person_id)
+                    class_ids.append(class_id)
                     bboxes.append(dino_segmentation.dino_bboxes)
                     embeddings.append(dino_segmentation.dino_embeddings)
                     overlaps.append(dino_segmentation.dino_overlaps)
 
+
+            assert len(person_ids) == len(class_ids) == len(bboxes) == len(embeddings) == len(overlaps) == len(images) == len(masks), f"Length mismatch: {len(person_ids)} {len(class_ids)} {len(bboxes)} {len(embeddings)} {len(overlaps)} {len(images)} {len(masks)}"
             yield {
-                "person_id": batch["person_id"],
-                "class_id": batch["class_id"],
+                "person_id": person_ids,
+                "class_id": class_ids,
                 "image": images,
                 "mask": masks,
                 # For these we cannot convert to tensors as each image has a different number of overlapping bboxes
@@ -383,7 +390,7 @@ if __name__ == "__main__":
         batch_sampler=sampler,
         num_workers=8,
         pin_memory=True,
-        collate_fn=reid_collate_fn
+        # collate_fn=reid_collate_fn
     )
 
     dino_dataloader = DinoDataLoaderWrapper(dataloader, transform=transform)
