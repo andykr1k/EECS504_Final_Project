@@ -354,4 +354,5 @@ def main(parent_dir: Path | str):
     
 
 if __name__ == "__main__":
-    main("/z/dat/person_reid/internal/input_videos")
+    main("/z/dat/person_reid/train/internal/input_videos")
+    main("/z/dat/person_reid/val/internal/input_videos")

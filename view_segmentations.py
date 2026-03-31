@@ -146,7 +146,7 @@ st.title("Person Re-ID Dataset Viewer")
 st.sidebar.header("Dataset Navigation")
 
 # 1. Root Directory Input
-default_root = "/z/dat/person_reid/internal/input_videos"
+default_root = "/z/dat/person_reid/train"
 dataset_root = st.sidebar.text_input("Dataset Root Directory", default_root)
 
 segmentation_dirs = get_segmentation_dirs(dataset_root)

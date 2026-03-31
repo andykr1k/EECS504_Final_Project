@@ -32,6 +32,9 @@ class Sam3ReIDDataset(Dataset):
         # {video_name: {slice_name: {global_class_id: [sample_idx, ...]}}}
         self.hierarchy = {}
 
+        # Map each video to its parent folder name
+        self.video_to_group = {}
+
         self._build_dataset()
 
     @Timer(name="Build Dataset", text="Build Dataset: {:.4f} seconds", logger=None)
@@ -39,7 +42,7 @@ class Sam3ReIDDataset(Dataset):
         logging.info(f"Scanning {self.root_dir} for dataset folders...")
         global_id_map = {}
 
-        segmentation_dirs = list(self.root_dir.rglob("*_segmentations"))
+        segmentation_dirs = sorted(list(self.root_dir.rglob("*_segmentations")))
 
         global_class_id = 0
         total_frames = 0
@@ -48,9 +51,13 @@ class Sam3ReIDDataset(Dataset):
         for seg_dir in segmentation_dirs:
             video_name = seg_dir.name.replace("_segmentations", "")
             assert video_name not in self.hierarchy, f"Duplicate video name: {video_name}"
+
+            group_name = seg_dir.parent.name
+            self.video_to_group[video_name] = group_name
+
             self.hierarchy[video_name] = {}
 
-            for slice_dir in seg_dir.iterdir():
+            for slice_dir in sorted(seg_dir.iterdir()):
                 if not slice_dir.is_dir():
                     print(f"WARNING: {slice_dir} is not a directory, skipping")
                     continue
@@ -230,7 +237,7 @@ class DinoDataLoaderWrapper:
                     dino_segmentations = self.dino_harness.match_bool_segmentations_to_dino(images, masks)
 
             with Timer("Process DINO Segmentations", text="Process DINO Segmentations: {:.4f} seconds", logger=None):
-                person_ids, class_ids, bboxes, embeddings, overlaps = [], [], [], [], []
+                valid_indices, person_ids, class_ids, bboxes, embeddings, overlaps = [], [], [], [], [], []
                 for batch_index, dino_segmentation in enumerate(dino_segmentations):
                     # The segmentations can include multiple objects, but we only use one so we expect there to only be one segmentation
                     if len(dino_segmentation) == 0:
@@ -241,12 +248,16 @@ class DinoDataLoaderWrapper:
                     person_id = batch["person_id"][batch_index]
                     class_id = batch["class_id"][batch_index]
 
+                    valid_indices.append(batch_index)
                     person_ids.append(person_id)
                     class_ids.append(class_id)
                     bboxes.append(dino_segmentation.dino_bboxes)
                     embeddings.append(dino_segmentation.dino_embeddings)
                     overlaps.append(dino_segmentation.dino_overlaps)
 
+            # Extract only the valid indices from the original batch
+            images = images[valid_indices]
+            masks = masks[valid_indices]
 
             assert len(person_ids) == len(class_ids) == len(bboxes) == len(embeddings) == len(overlaps) == len(images) == len(masks), f"Length mismatch: {len(person_ids)} {len(class_ids)} {len(bboxes)} {len(embeddings)} {len(overlaps)} {len(images)} {len(masks)}"
             yield {
@@ -270,31 +281,80 @@ class VideoSlicePKBatchSampler(Sampler):
     2. Only one slice per video per batch to prevent negatives pairs that are actually from the same person from different scenes.
     3. When possible, pull desired_identies_per_video identities from the same slice to maximize hard negatives.
     """
-    def __init__(self, dataset: Sam3ReIDDataset, num_identities: int, instances_per_identity: int, desired_identies_per_video: int = 2):
+    def __init__(self,
+        dataset: Sam3ReIDDataset,
+        num_identities: int,
+        instances_per_identity: int,
+        desired_identies_per_video: int = 2,
+        group_weights: dict | None = None,
+        seed: int | None = None,
+        epoch_deterministic: bool = False  # If true, seed is reset every epoch
+    ):
         self.heirarchy = dataset.hierarchy
+        self.video_to_group = dataset.video_to_group # Pull the group map from the dataset
+
         self.P = num_identities
         self.K = instances_per_identity
         self.desired_identies_per_video = desired_identies_per_video
+
+        self.seed = seed
+        self.epoch_deterministic = epoch_deterministic
+        self.rng = random.Random(self.seed) if self.seed is not None else random.Random()
 
         self.batch_size = self.P * self.K
 
         self.total_samples = len(dataset)
         self.num_batches = self.total_samples // self.batch_size
+
+        # Setup group-based sampling logic
+        # Find all unique groups
+        unique_groups = set(self.video_to_group.values())
+        
+        # If no weights are provided, default to uniform sampling across groups
+        if group_weights is None:
+            self.group_weights = {g: 1.0 / len(unique_groups) for g in unique_groups}
+            print(f"Using uniform group weights: {self.group_weights}")
+        else:
+            # Ensure the provided weights match the found groups
+            assert set(group_weights.keys()) == unique_groups, f"Provided weights {list(group_weights.keys())} do not match dataset groups {list(unique_groups)}"
+            self.group_weights = group_weights
+            print(f"Using provided group weights: {self.group_weights}")
+        
+        # Initialize separate caches for each group
+        self.group_caches = {g: [] for g in unique_groups}
+
         print(f"Initialized VideoSlicePKBatchSampler with P={self.P}, K={self.K}, batch_size={self.batch_size}, num_batches={self.num_batches}")
 
         self.video_order_cache = []
     
     def _sample_video(self):
         """
-        Returns a random video, but ensures that we sample all videos equally over time.
+        Samples a video biased by the group weights. 
+        Automatically refills and reshuffles a group's cache when exhausted.
         """
-        if len(self.video_order_cache) == 0:
-            self.video_order_cache = list(self.heirarchy.keys())
-            random.shuffle(self.video_order_cache)
+        # 1. Pick a group based on the weights
+        groups = list(self.group_weights.keys())
+        weights = [self.group_weights[g] for g in groups]
+        chosen_group = self.rng.choices(groups, weights=weights, k=1)[0]
+
+        # 2. Check if the cache for the chosen group is empty, refill if necessary
+        if len(self.group_caches[chosen_group]) == 0:
+            # Get all video names that belong to this group
+            videos_in_group = [v for v, g in self.video_to_group.items() if g == chosen_group]
+            self.rng.shuffle(videos_in_group)
+            self.group_caches[chosen_group] = videos_in_group
         
-        return self.video_order_cache.pop()
+        # 3. Pop a video from the chosen group's cache
+        return self.group_caches[chosen_group].pop()
 
     def __iter__(self):
+        if self.epoch_deterministic:
+            print(f"Resetting RNG for epoch with seed {self.seed}")
+            self.rng = random.Random(self.seed) if self.seed is not None else random.Random()
+            # Clear all caches on epoch reset
+            for g in self.group_caches:
+                self.group_caches[g].clear()
+
         for _ in range(self.num_batches):
             with Timer("Sample PK", text="Sample PK: {:.4f} seconds", logger=None):
                 batch = []
@@ -311,14 +371,14 @@ class VideoSlicePKBatchSampler(Sampler):
                     if video_name in slice_choice_cache:
                         slice_name = slice_choice_cache[video_name]
                     else:
-                        slice_name = random.choice(list(video_data.keys()))
+                        slice_name = self.rng.choice(list(video_data.keys()))
                         slice_choice_cache[video_name] = slice_name
                     slice_data = video_data[slice_name]
 
                     # Get the identities in the slice
                     slice_identities = list(slice_data.keys())
                     valid_slice_identities = [identity for identity in slice_identities if len(slice_data[identity]) >= self.K]
-                    random.shuffle(valid_slice_identities)
+                    self.rng.shuffle(valid_slice_identities)
 
                     # Choose a set of identities to pull from this slice
                     num_identities_to_pull = min(len(valid_slice_identities), self.P - identities_in_batch, self.desired_identies_per_video)
@@ -330,7 +390,7 @@ class VideoSlicePKBatchSampler(Sampler):
                         # We sample with enforced diversity by spacing out the samples over the entire video
                         N = len(instances)
                         spaced_samples = [
-                            random.choice(instances[i * N // self.K : (i + 1) * N // self.K]) 
+                            self.rng.choice(instances[i * N // self.K : (i + 1) * N // self.K]) 
                             for i in range(self.K)
                         ]
 
@@ -366,7 +426,7 @@ if __name__ == "__main__":
 
     # 2. Instantiate the Dataset (Preprocessing / file searching happens here)
     dataset = Sam3ReIDDataset(
-        root_dir="/z/dat/person_reid/internal/input_videos",
+        root_dir="/z/dat/person_reid/train",
         transform=None,
         target_size=(1080, 1920)
     )
@@ -409,7 +469,7 @@ if __name__ == "__main__":
         
         # Pass to model and Circle Loss...
         print(f"Images length: {len(images)}, First image shape: {images[0].shape}")
-        print(f"Labels shape: {labels.shape}")
+        print(f"Labels shape: {len(labels)}")
         print(f"Masks length: {len(masks)}, First mask shape: {masks[0].shape}")
         break
 

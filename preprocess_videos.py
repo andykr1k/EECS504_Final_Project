@@ -233,6 +233,8 @@ def main(parent_dir: Path, threshold: float = 0.2, max_workers: int = 4):
 
 if __name__ == "__main__":
     # Required for safe multiprocessing on Windows and occasionally Linux
-    parent_dir = Path("/z/dat/person_reid/internal/input_videos")
-    mp.freeze_support() 
-    main(parent_dir, threshold=0.2, max_workers=32)
+    train_parent_dir = Path("/z/dat/person_reid/train/internal/input_videos")
+    val_parent_dir = Path("/z/dat/person_reid/val/internal/input_videos")
+    mp.freeze_support()
+    main(train_parent_dir, threshold=0.2, max_workers=32)
+    main(val_parent_dir, threshold=0.2, max_workers=32)
