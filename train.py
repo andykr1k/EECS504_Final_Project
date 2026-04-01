@@ -13,6 +13,11 @@ from tqdm import tqdm
 import wandb
 import numpy as np
 import random
+from collections import defaultdict
+from pathvalidate import sanitize_filename
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import umap
 
 from sam3_reid_dataset import Sam3ReIDDataset, VideoSlicePKBatchSampler, DinoDataLoaderWrapper
 
@@ -81,6 +86,147 @@ def compute_circle_loss(embeddings: torch.Tensor, labels: torch.Tensor, criterio
         return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
         
     return torch.mean(torch.stack(losses))
+
+def compute_batch_metrics(embeddings: torch.Tensor, labels: torch.Tensor, m: float = 0.25) -> dict:
+    """
+    Computes within-batch evaluation metrics.
+    """
+    # 1. Compute cosine similarity matrix
+    embeddings = F.normalize(embeddings, p=2, dim=1)
+    sim_matrix = torch.matmul(embeddings, embeddings.t())
+    
+    B = labels.size(0)
+    labels_matrix = labels.unsqueeze(0) == labels.unsqueeze(1)
+    identity_mask = torch.eye(B, dtype=torch.bool, device=labels.device)
+    
+    pos_mask = labels_matrix & ~identity_mask
+    neg_mask = ~labels_matrix
+    
+    # Extract positive and negative similarities
+    sp = sim_matrix[pos_mask]
+    sn = sim_matrix[neg_mask]
+    
+    # --- METRICS: Margins & Distributions ---
+    delta_p = 1 - m
+    delta_n = m
+    
+    pct_pos_margin = (sp > delta_p).float().mean().item() if sp.numel() > 0 else 0.0
+    pct_neg_margin = (sn < delta_n).float().mean().item() if sn.numel() > 0 else 0.0
+    
+    mean_pos_sim = sp.mean().item() if sp.numel() > 0 else 0.0
+    mean_neg_sim = sn.mean().item() if sn.numel() > 0 else 0.0
+    
+    # --- METRICS: Retrieval (Top-K & mAP) ---
+    # Ignore self-similarity by setting the diagonal to -infinity
+    sim_matrix.fill_diagonal_(float('-inf'))
+    
+    # Sort similarities descending to get retrieval rankings
+    sorted_sim, sorted_indices = torch.sort(sim_matrix, dim=1, descending=True)
+    sorted_labels = labels[sorted_indices]
+    
+    # Boolean mask of matches (True if retrieved ID matches query ID)
+    matches = sorted_labels == labels.unsqueeze(1)
+    
+    # Top-1 Accuracy: Is the #1 closest embedding a match?
+    top1 = matches[:, 0].float().mean().item()
+    
+    # Top-5 Accuracy: Is there *any* match in the top 5 closest embeddings?
+    k = min(5, B - 1)
+    top5 = matches[:, :k].any(dim=1).float().mean().item()
+    
+    # Batch mAP (Mean Average Precision)
+    num_positives = pos_mask.sum(dim=1)
+    aps = []
+    for i in range(B):
+        if num_positives[i] == 0:
+            continue
+        
+        # Get indices of positive matches in the sorted array
+        query_matches = matches[i]
+        pos_indices = torch.nonzero(query_matches).squeeze(1)
+        
+        # Rank of each positive match (1-based indexing)
+        ranks = pos_indices + 1
+        
+        # Precision at each positive rank
+        # e.g. if matches are at rank 1, 3, 4 -> precisions are 1/1, 2/3, 3/4
+        arange = torch.arange(1, len(ranks) + 1, device=ranks.device)
+        precisions = arange / ranks.float()
+        
+        ap = precisions.sum() / num_positives[i].float()
+        aps.append(ap.item())
+        
+    mAP = sum(aps) / len(aps) if aps else 0.0
+    
+    return {
+        "pct_pos_margin": pct_pos_margin,
+        "pct_neg_margin": pct_neg_margin,
+        "mean_pos_sim": mean_pos_sim,
+        "mean_neg_sim": mean_neg_sim,
+        "top1": top1,
+        "top5": top5,
+        "mAP": mAP
+    }
+
+def log_umap_visualization(embeddings: torch.Tensor, labels: torch.Tensor, epoch: int):
+    """
+    Reduces embeddings to 2D using PCA then UMAP, and logs a scatter plot to W&B.
+    """
+    # Move to CPU and convert to numpy
+    embeddings_np = embeddings.cpu().numpy()
+    labels_np = labels.cpu().numpy()
+    
+    # 1. PCA down to 50 dimensions (or max possible if less than 50 samples/dims)
+    n_pca_components = min(50, embeddings_np.shape[0], embeddings_np.shape[1])
+    if embeddings_np.shape[1] > n_pca_components:
+        pca = PCA(n_components=n_pca_components)
+        embeddings_reduced = pca.fit_transform(embeddings_np)
+    else:
+        embeddings_reduced = embeddings_np
+        
+    # 2. UMAP down to 2 dimensions
+    # random_state ensures reproducibility across epochs if the data order is the same
+    reducer = umap.UMAP(n_components=2, random_state=42)
+    embeddings_2d = reducer.fit_transform(embeddings_reduced)
+    
+    # 3. Plotting
+    plt.figure(figsize=(10, 8))
+    unique_labels = np.unique(labels_np)
+    
+    # Use a colormap with enough discrete colors (tab20 has 20 distinct colors)
+    cmap = plt.get_cmap('tab20')
+    
+    for i, label in enumerate(unique_labels):
+        idx = labels_np == label
+        # Pick a color based on the label index, cycling if there are >20 classes
+        color = cmap(i % 20)
+        plt.scatter(
+            embeddings_2d[idx, 0], 
+            embeddings_2d[idx, 1], 
+            label=f"ID: {label}", 
+            color=color, 
+            alpha=0.7, 
+            s=30, # Marker size
+            edgecolors='w',
+            linewidth=0.5
+        )
+        
+    plt.title(f"UMAP Projection of Validation Embeddings (Epoch {epoch})")
+    plt.xlabel("UMAP Dimension 1")
+    plt.ylabel("UMAP Dimension 2")
+    
+    # Only show legend if we have a reasonable number of identities (e.g., <= 20)
+    # Otherwise, it takes up the whole plot.
+    if len(unique_labels) <= 20:
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', markerscale=1.5)
+        
+    plt.tight_layout()
+    
+    # 4. Log to wandb
+    wandb.log({f"Val Embeddings UMAP": wandb.Image(plt)}, commit=False)
+    
+    # Free memory
+    plt.close()
 
 # ==========================================
 # 2. Model Architecture
@@ -316,12 +462,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, max_
     return total_loss / len(dataloader)
 
 @torch.no_grad()
-def validate(model, dataloader, criterion, device, epoch, max_batches=None):
+def validate(model, dataloader, criterion, device, epoch, args, max_batches=None):
     model.eval()
     total_loss = 0.0
+    metrics_accumulator = defaultdict(float)
+    
+    # --- NEW: Accumulators for visualization ---
+    all_embeddings = []
+    all_labels = []
     
     num_batches = min(len(dataloader), max_batches) if max_batches is not None else len(dataloader)
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} Val", total=num_batches)
+    
     for batch_idx, batch in enumerate(pbar):
         if batch_idx >= num_batches:
             break
@@ -331,16 +483,39 @@ def validate(model, dataloader, criterion, device, epoch, max_batches=None):
         
         final_embeddings = model(embeddings_list)
         loss = compute_circle_loss(final_embeddings, labels, criterion)
-        
         total_loss += loss.item()
-        pbar.set_postfix({'val_loss': loss.item()})
         
-    avg_loss = total_loss / (num_batches + 1)
-    wandb.log({"val_epoch_loss": avg_loss})
+        # --- NEW: Save embeddings and labels for this batch ---
+        all_embeddings.append(final_embeddings.detach().cpu())
+        all_labels.append(labels.detach().cpu())
+        
+        batch_metrics = compute_batch_metrics(final_embeddings, labels, m=args.circle_margin)
+        for k, v in batch_metrics.items():
+            metrics_accumulator[k] += v
+            
+        pbar.set_postfix({
+            'val_loss': loss.item(), 
+            'top1': f"{batch_metrics['top1']:.2f}"
+        })
+        
+    avg_loss = total_loss / num_batches
+    
+    # Average the accumulated metrics
+    epoch_metrics = {f"val_{k}": v / num_batches for k, v in metrics_accumulator.items()}
+    epoch_metrics["val_epoch_loss"] = avg_loss
+    
+    wandb.log(epoch_metrics)
+    
+    # --- NEW: Trigger UMAP Visualization ---
+    if all_embeddings:
+        full_embeddings_tensor = torch.cat(all_embeddings, dim=0)
+        full_labels_tensor = torch.cat(all_labels, dim=0)
+        log_umap_visualization(full_embeddings_tensor, full_labels_tensor, epoch)
+        
     return avg_loss
 
 def main(args):
-    wandb.init(project="sam3-reid", config=vars(args))
+    wandb.init(project="sam3-reid", config=vars(args), name=args.run_name)
     
     device = torch.device(args.device)
     logging.info(f"Using device: {device}")
@@ -381,7 +556,7 @@ def main(args):
     criterion = CircleLoss(m=args.circle_margin, gamma=args.circle_gamma)
 
     # Training Loop
-    initial_val_loss = validate(model, val_loader, criterion, device, 0, max_batches=args.val_max_batches)
+    initial_val_loss = validate(model, val_loader, criterion, device, epoch=0, args=args, max_batches=args.val_max_batches)
     wandb.log({
         "epoch": 0,
         "val_loss": initial_val_loss,
@@ -391,7 +566,7 @@ def main(args):
     best_val_loss = float('inf')
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
-        val_loss = validate(model, val_loader, criterion, device, epoch, max_batches=args.val_max_batches)
+        val_loss = validate(model, val_loader, criterion, device, epoch=epoch, args=args, max_batches=args.val_max_batches)
         # val_loss = 0
         scheduler.step()
         
@@ -457,12 +632,23 @@ if __name__ == "__main__":
     parser.add_argument("--train_max_batches", type=int, default=None, help="Maximum number of batches to use for training")
     
     # Misc
-    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--checkpoint_dir", type=str, default=None)
     
     logging.basicConfig(level=logging.INFO)
     args = parser.parse_args()
 
+    if args.run_name is None:
+        args.run_name = input("Enter a run name: ")
+        assert args.run_name, "Run name cannot be empty"
+
+    if args.checkpoint_dir is None:
+        safe_run_name = sanitize_filename(args.run_name)
+        safe_run_name = safe_run_name.replace(" ", "_")
+        args.checkpoint_dir = f"./checkpoints/{safe_run_name}"
+
     # Set all our seeds
+    print(f"Using seed: {args.seed}")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
