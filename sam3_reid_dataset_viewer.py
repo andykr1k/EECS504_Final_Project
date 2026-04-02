@@ -11,7 +11,8 @@ from sam3_reid_dataset import (
     Sam3ReIDDataset, 
     VideoSlicePKBatchSampler, 
     reid_collate_fn, 
-    DinoDataLoaderWrapper
+    DinoDataLoaderWrapper,
+    ApplyBackgroundMask
 )
 
 st.set_page_config(page_title="Re-ID Dataset Viewer", layout="wide")
@@ -21,7 +22,7 @@ st.markdown("This app samples a single $P \\times K$ batch from the dataset to v
 
 # --- Sidebar Configuration ---
 st.sidebar.header("Dataset Configuration")
-data_dir = st.sidebar.text_input("Dataset Directory", value="/z/dat/person_reid/internal/input_videos")
+data_dir = st.sidebar.text_input("Dataset Directory", value="/z/dat/person_reid/train")
 
 st.sidebar.header("PK Sampler Params")
 P = st.sidebar.number_input("P (Identities per batch)", min_value=2, max_value=32, value=4)
@@ -54,6 +55,8 @@ def load_dataloader(root_dir, use_transforms=False, P=4, K=4):
         
         # Randomly apply Gaussian Blur to 10% of images to simulate poor focus
         v2.RandomApply([v2.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.0))], p=0.1),
+
+        v2.RandomApply([ApplyBackgroundMask(bg_val=0.0)], p=0.5),
     ])
     dataset = Sam3ReIDDataset(
         root_dir=root_dir,

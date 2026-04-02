@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import umap
 
-from sam3_reid_dataset import Sam3ReIDDataset, VideoSlicePKBatchSampler, DinoDataLoaderWrapper
+from sam3_reid_dataset import Sam3ReIDDataset, VideoSlicePKBatchSampler, DinoDataLoaderWrapper, ApplyBackgroundMask
 
 # ==========================================
 # 1. Losses
@@ -405,9 +405,29 @@ class ReIDTransformerModel(nn.Module):
 
 def get_dataloaders(args):
     # Common transforms
+    # transform = v2.Compose([
+    #     v2.RandomHorizontalFlip(p=0.5),
+    #     v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+    # ])
     transform = v2.Compose([
+        # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
+        
+        # Slight rotation (±5 degrees), translation (±5%), and scaling (95% to 105%)
+        # The mask will perfectly track with these changes.
+        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+
+        # --- 2. Color and Lighting (Photometric) ---
         v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        # v2.RandomGrayscale(p=0.1),
+        
+        # Randomly apply Gaussian Blur to 10% of images to simulate poor focus
+        v2.RandomApply([v2.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.0))], p=0.1),
+
+        v2.RandomApply([ApplyBackgroundMask(bg_val=0.0)], p=0.5),
+    ])
+    only_mask_transform = v2.Compose([
+        v2.RandomApply([ApplyBackgroundMask(bg_val=0.0)], p=1),
     ])
 
     train_dataset = Sam3ReIDDataset(root_dir=args.train_dir, transform=None)

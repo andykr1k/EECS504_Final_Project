@@ -115,12 +115,18 @@ python train.py \
   --dino_dim 1024 \
   --train_max_batches 500
 ```
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type transformer \
+  --dino_checkpoint "facebook/dinov3-vith16plus-pretrain-lvd1689m" \
+  --dino_dim 1280 \
+  --train_max_batches 500
+```
 
 ### Inference:
 **Clustering**: Assigning unique IDs to each segment.
 Define a similarity matrix S where S[i, j] is the similarity between segment i and segment j. If i and j appear in the same scene at the same time, they cannot be the same person so set similarity low. When processing the video with SAM3 if i and j correspond to the same object id, set similarity high. Otherwise, set similarity to the cosine similarity of their embeddings. Then cluster the segments using agglomerative clustering. The within single video clustering will regularize the clustering across the long form video.
-
-Conversation I was having with Gemini:
-https://gemini.google.com/app/72d07bf9b7540e45
 
 **Masking**: Segment faces in the video using a face segmentation model. Find overlap with a SAM segmentation for the individual. Assign the segmentation to one of the clusters. Color the face using the cluster ID.

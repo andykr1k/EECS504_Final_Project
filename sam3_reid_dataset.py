@@ -402,6 +402,31 @@ class VideoSlicePKBatchSampler(Sampler):
     def __len__(self):
         return self.num_batches
 
+class ApplyBackgroundMask(torch.nn.Module):
+    """
+    Applies the segmentation mask to the image, 
+    setting the background to a specific value (default black).
+    """
+    def __init__(self, bg_val=0.0):
+        super().__init__()
+        self.bg_val = bg_val
+
+    def forward(self, image, mask):
+        # Convert the boolean mask to the same float type as the image
+        mask_float = mask.to(dtype=image.dtype)
+        
+        # Ensure mask has a channel dimension (1, H, W) for broadcasting
+        if mask_float.ndim == 2:
+            mask_float = mask_float.unsqueeze(0)
+        
+        # Apply mask: Foreground remains, background becomes bg_val
+        masked_image = image * mask_float + self.bg_val * (1.0 - mask_float)
+        
+        # Re-wrap to ensure downstream v2 transforms still recognize it as an Image
+        image = tv_tensors.Image(masked_image)
+            
+        return image, mask
+
 if __name__ == "__main__":
     import dotenv
     dotenv.load_dotenv()
@@ -422,6 +447,10 @@ if __name__ == "__main__":
         
         # Randomly apply Gaussian Blur to 10% of images to simulate poor focus
         v2.RandomApply([v2.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5.0))], p=0.1),
+
+        # --- 3. Occlusion Simulation ---
+        v2.RandomApply([ApplyBackgroundMask(bg_val=0.0)], p=0.5),
+
     ])
 
     # 2. Instantiate the Dataset (Preprocessing / file searching happens here)
