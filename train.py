@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import umap
 
-from sam3_reid_dataset import Sam3ReIDDataset, VideoSlicePKBatchSampler, DinoDataLoaderWrapper, ApplyBackgroundMask
+from sam3_reid_dataset import Sam3ReIDDataset, VideoSlicePKBatchSampler, DinoDataLoaderWrapper, ApplyBackgroundMask, RandomSubjectZoom
 
 # ==========================================
 # 1. Losses
@@ -412,6 +412,8 @@ def get_dataloaders(args):
     transform = v2.Compose([
         # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
+
+        v2.RandomApply([RandomSubjectZoom(scale_range=(1.0, 2.0))], p=0.25),
         
         # Slight rotation (±5 degrees), translation (±5%), and scaling (95% to 105%)
         # The mask will perfectly track with these changes.

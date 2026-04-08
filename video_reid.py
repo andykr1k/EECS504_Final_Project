@@ -13,6 +13,7 @@ from transformers import Sam3VideoModel, Sam3VideoProcessor
 import scipy.spatial.distance as ssd
 from scipy.cluster.hierarchy import linkage, fcluster
 import h5py
+from typing import Literal
 
 import dino_lib
 
@@ -36,6 +37,8 @@ class SceneSlice:
     scene_id: SceneID  # Unique to this scene slice. Corresponds to the file name
     start_frame: FrameIndex  # Inclusive. When this scene starts
     end_frame: FrameIndex  # Exclusive. When this scene ends
+    transnet_scene_start: FrameIndex = 0
+    transnet_scene_end: FrameIndex = 0
 
 @dataclass
 class TrackletMetadata:
@@ -58,10 +61,22 @@ class TrackletData:
 class ReIDConfig:
     video_path: Path
     out_dir: Path
+    apply_mask_for_dino: bool = False
 
     sam3_prompt: str = "Child, Children, Student, Students"
 
-    max_scene_len_frames: int = 60 * 20
+    tracklet_similarity_method: Literal["percentile", "chamfer", "top_k_mean"] = "percentile"
+    tracklet_similarity_percentile: float = 0.9
+    tracklet_chamfer_percentile: float = 0.1
+    tracklet_top_k_mean_k: int = 5
+
+    exclusion_dist: float = 2.0
+    cluster_similarity_threshold: float = 0.25
+    min_tracklet_len: int = 2
+
+    max_scene_len_frames: int = 60 * 10
+    scene_trim_seconds: float = 0.0
+    segmentation_trim_seconds: float = 0.5
 
     @property
     def scenes_dir(self) -> Path:
@@ -124,43 +139,50 @@ def split_video(video_path: Path, out_dir: Path, max_len_frames: int) -> tuple[l
     model.eval()
     
     # 1. Detect scenes
-    # We use a threshold of 0.2 as defined in the reference script
     scenes = model.detect_scenes(str(video_path), threshold=0.2)
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     
     scene_slices: list[SceneSlice] = []
-    
-    # 2. Constrain scene lengths and build SceneSlice objects
-    for scene in scenes:
-        # TransNetV2 returns inclusive start and end frames
-        start_frame = scene['start_frame']
-        # Convert to exclusive end_frame for our dataclass
-        end_frame_exclusive = scene['end_frame'] + 1 
-        
-        current_start = start_frame
-        while current_start < end_frame_exclusive:
-            current_end = min(current_start + max_len_frames, end_frame_exclusive)
-            
-            scene_id = f"s{current_start:06d}_e{current_end:06d}"
-            scene_slices.append(SceneSlice(
-                scene_id=scene_id,
-                start_frame=current_start,
-                end_frame=current_end
-            ))
-            current_start = current_end
-
-    if not scene_slices:
-        print(f"No scenes found in {video_path.name}.")
-        return [], 0.0
-
-    # 3. Extract and save the video chunks
-    print(f"Extracting {len(scene_slices)} scene chunks...")
-    out_dir.mkdir(parents=True, exist_ok=True)
     
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video: {video_path}")
         
     fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    # 2. Constrain scene lengths and build SceneSlice objects
+    for scene in scenes:
+        # TransNetV2 returns inclusive start and end frames
+        true_scene_start = scene['start_frame']
+        # Convert to exclusive end_frame for our dataclass
+        true_scene_end = scene['end_frame'] + 1 
+        
+        current_start = true_scene_start
+        while current_start < true_scene_end:
+            current_end = min(current_start + max_len_frames, true_scene_end)
+            
+            scene_id = f"s{current_start:06d}_e{current_end:06d}"
+            scene_slices.append(SceneSlice(
+                scene_id=scene_id,
+                start_frame=current_start,
+                end_frame=current_end,
+                transnet_scene_start=true_scene_start,
+                transnet_scene_end=true_scene_end
+            ))
+            current_start = current_end
+
+    if not scene_slices:
+        print(f"No scenes found in {video_path.name}.")
+        cap.release()
+        return [], 0.0
+
+    # 3. Extract and save the video chunks
+    print(f"Extracting {len(scene_slices)} scene chunks...")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
     current_frame_idx = 0
     scene_idx = 0
     
@@ -302,7 +324,30 @@ def extract_segmentations(video_frames: VideoFramesNp, sam_harness: SAMHarness, 
             score = float(frame_scores[j])
 
             # Process mask tensor
-            mask_np = frame_masks[j].cpu().numpy().astype(bool)
+            mask_np = frame_masks[j].cpu().numpy().astype(np.uint8) * 255
+
+            # 1. Morphological Opening & Closing
+            # Tune kernel_size based on your frame resolution. 5-7 is usually a good starting point.
+            kernel_size = 5 
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+            
+            # Opening: Removes isolated speckles in the background
+            mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
+            
+            # Closing: Fills in small holes inside the segmented object
+            mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
+
+            # 2. Connected Component Filtering
+            # SAM sometimes hallucinates disjointed patches nowhere near the main object.
+            # If your prompt implies a single contiguous object, keep only the largest blob.
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+            
+            if num_labels > 1: # num_labels includes the background (label 0)
+                # Find the label of the largest component excluding the background
+                largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+                mask_np = (labels == largest_label)
+            else:
+                mask_np = mask_np.astype(bool)
 
             # Map the SAM object ID to our internal contiguous ID
             seg_idx = SEG_ID_TYPE(frame_obj_ids[j])
@@ -315,24 +360,30 @@ def extract_segmentations(video_frames: VideoFramesNp, sam_harness: SAMHarness, 
             segmentations[frame_idx][mask_np] = seg_idx
             confidences[frame_idx][seg_idx] = score
 
-            # Write mask and score to our final structures
-            # Note: In cases where masks slightly overlap, the later ID in the loop 
-            # will overwrite the earlier ID for those specific pixels.
-            segmentations[frame_idx][mask_np] = seg_idx
-            confidences[frame_idx][seg_idx] = score
+    # Explicitly delete the session and lists that hold tensors
+    del inference_session
+    del frames_list
+    
+    # Force PyTorch to release the cached memory back to the OS
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return segmentations, confidences
 
-def align_segmentations_to_dino(video_frames: VideoFramesNp, segmentations: SamSegmentationsNp, dino_harness: dino_lib.DinoHarness) -> list[dict[SegmentationIndex, SegmentedDinoEmbeddings]]:
+def align_segmentations_to_dino(
+    video_frames: VideoFramesNp, 
+    segmentations: SamSegmentationsNp, 
+    dino_harness: dino_lib.DinoHarness, 
+    apply_mask: bool = False,
+    scene_slice: SceneSlice | None = None,
+    trim_frames: int = 0
+) -> list[dict[SegmentationIndex, SegmentedDinoEmbeddings]]:
     """
     Extracts the full DINO features for each frame and aligns them to the segmentations.
     Returns a list of dictionaries where each dictionary represents a frame and
     maps a segmentation index to its DINO embedding of shape (n_overlapping_patches, dino_embedding_dim)
-    """
-    """
-    Extracts the full DINO features for each frame and aligns them to the segmentations.
-    Returns a list of dictionaries where each dictionary represents a frame and
-    maps a segmentation index to its DINO embedding of shape (n_overlapping_patches, dino_embedding_dim)
+
+    If apply_mask is true, then the background is set to 0 before passing to dino.
     """
     num_frames = video_frames.shape[0]
     batch_size = 16  # Process in batches to prevent GPU OOM
@@ -344,30 +395,49 @@ def align_segmentations_to_dino(video_frames: VideoFramesNp, segmentations: SamS
         frames_batch = video_frames[start_idx:end_idx]
         segs_batch = segmentations[start_idx:end_idx].copy()
         
-        # 1. Prepare images: (B, H, W, C) -> list of (C, H, W) tensors
         images_list = []
-        for i in range(frames_batch.shape[0]):
-            # Convert to torch tensor and rearrange to Channel-First format
-            img_t = torch.from_numpy(frames_batch[i]).permute(2, 0, 1)
-            images_list.append(img_t)
-            
-        # 2. Prepare segmentations: Map 0 (SAM background) to -1 (DINO skip)
         segs_list = []
-        for i in range(segs_batch.shape[0]):
-            seg = segs_batch[i]
-            # dino_harness ignores person_id == -1
-            seg = np.where(seg == MAX_SEG_ID, -1, seg)
-            segs_list.append(seg)
-            
-        # 3. Run DINO harness batched processing
-        dino_outputs = dino_harness.match_segmentations_to_dino(images_list, segs_list)
+        frame_is_trimmed = []
         
-        # 4. Format outputs mapping SegmentationIndex -> SegmentedDinoEmbeddings (numpy)
-        for frame_dino_segs in dino_outputs:
+        for i in range(frames_batch.shape[0]):
+            frame_idx_in_chunk = start_idx + i
+            is_trimmed = False
+            if scene_slice is not None and trim_frames > 0:
+                global_frame = scene_slice.start_frame + frame_idx_in_chunk
+                if global_frame < scene_slice.transnet_scene_start + trim_frames:
+                    is_trimmed = True
+                if global_frame >= scene_slice.transnet_scene_end - trim_frames:
+                    is_trimmed = True
+                    
+            frame_is_trimmed.append(is_trimmed)
+            
+            if not is_trimmed:
+                frame = frames_batch[i]
+                if apply_mask:
+                    is_background = (segs_batch[i] == MAX_SEG_ID)[..., np.newaxis]
+                    frame = np.where(is_background, 0, frame)
+                img_t = torch.from_numpy(frame).permute(2, 0, 1)
+                images_list.append(img_t)
+                
+                seg = segs_batch[i]
+                seg = np.where(seg == MAX_SEG_ID, -1, seg)
+                segs_list.append(seg)
+                
+        # 3. Run DINO harness batched processing ONLY on non-trimmed frames
+        if images_list:
+            dino_outputs = dino_harness.match_segmentations_to_dino(images_list, segs_list)
+        else:
+            dino_outputs = []
+            
+        # 4. Format outputs mapping
+        dino_out_idx = 0
+        for i in range(frames_batch.shape[0]):
             frame_dict = {}
-            for dino_seg in frame_dino_segs:
-                # Type mapping: Convert torch.Tensor to np.ndarray as defined by SegmentedDinoEmbeddings
-                frame_dict[dino_seg.person_id] = dino_seg.dino_embeddings.cpu().numpy()
+            if not frame_is_trimmed[i]:
+                frame_dino_segs = dino_outputs[dino_out_idx]
+                for dino_seg in frame_dino_segs:
+                    frame_dict[dino_seg.person_id] = dino_seg.dino_embeddings.cpu().numpy()
+                dino_out_idx += 1
             
             aligned_results.append(frame_dict)
             
@@ -431,7 +501,8 @@ def process_scene_segmentations(
     config: ReIDConfig,
     sam_harness: SAMHarness,
     dino_harness: dino_lib.DinoHarness,
-    contrastive_head: torch.nn.Module
+    contrastive_head: torch.nn.Module,
+    trim_frames: int = 0
 ) -> tuple[SamSegmentationsNp, list[dict[SegmentationIndex, float]], list[dict[SegmentationIndex, ContrastiveEmbedding]]]:
     """
     Process the segmentations for a single scene slice.
@@ -481,7 +552,10 @@ def process_scene_segmentations(
     dino_embeddings = align_segmentations_to_dino(
         video_frames=video_frames,
         segmentations=segmentations,
-        dino_harness=dino_harness
+        dino_harness=dino_harness,
+        apply_mask=config.apply_mask_for_dino,
+        scene_slice=scene_slice,
+        trim_frames=trim_frames
     )
     
     # 5. Generate final contrastive embeddings for ReID clustering
@@ -525,6 +599,8 @@ def track_segmentations(
     min_frame_mask_ratio: float = 0.001,
     min_tracklet_len: int = 10,
     tracklet_start_index: int = 0,
+    scene_slice: SceneSlice | None = None,
+    segmentation_trim_frames: int = 0
 ) -> tuple[list[TrackletData], list[TrackletMetadata]]:
     """
     Track the segmentations across frames and when they drop below a certain threshold of pixels
@@ -540,6 +616,14 @@ def track_segmentations(
     final_tracklets_meta: list[TrackletMetadata] = []
     
     current_tracklet_id = tracklet_start_index
+
+    if num_frames <= 2*segmentation_trim_frames:
+        # Set segmentation_trim_frames such that the scene has at least 3 frames remaining
+        segmentation_trim_frames = (num_frames - 3) // 2
+        print(f"WARNING: num_frames ({num_frames}) is less than 2*segmentation_trim_frames ({2*segmentation_trim_frames}). Setting segmentation_trim_frames to {segmentation_trim_frames}.")
+        if segmentation_trim_frames < 0:
+            print(f"WARNING: Scene is too short to trim. Setting segmentation_trim_frames to 0.")
+            segmentation_trim_frames = 0
     
     for f in range(num_frames):
         # Find unique segmentations and their pixel counts in the current frame
@@ -551,9 +635,20 @@ def track_segmentations(
             if seg_idx == MAX_SEG_ID:
                 continue  # Skip background
             
+            is_seg_trimmed = False
+            if scene_slice is not None and segmentation_trim_frames > 0:
+                global_frame = scene_slice.start_frame + f
+                if global_frame < scene_slice.transnet_scene_start + segmentation_trim_frames:
+                    is_seg_trimmed = True
+                if global_frame >= scene_slice.transnet_scene_end - segmentation_trim_frames:
+                    is_seg_trimmed = True
+
+                if is_seg_trimmed:
+                    print(f"Trimming frame {f} (global frame {global_frame}) for scene {scene_slice.scene_id}")
+                    continue
+
             ratio = count / total_pixels
             if ratio >= min_frame_mask_ratio:
-                # DINO / Contrastive embedding must be present to be a valid frame
                 emb = contrastive_embeddings[f].get(seg_idx)
                 
                 if emb is not None:
@@ -571,7 +666,8 @@ def track_segmentations(
                     active_tracklets[seg_idx]["frame_indices"].append(f)
                     active_tracklets[seg_idx]["confidences"].append(confidences[f].get(seg_idx, 0.0))
                     active_tracklets[seg_idx]["mask_sizes"].append(int(count))
-                    active_tracklets[seg_idx]["embeddings"].append(emb)
+                    if emb is not None:
+                        active_tracklets[seg_idx]["embeddings"].append(emb)
         
         # Check for active tracklets that have dropped out in the current frame
         dropped_segs = []
@@ -583,7 +679,7 @@ def track_segmentations(
         for dropped_seg in dropped_segs:
             trk = active_tracklets.pop(dropped_seg)
             
-            if len(trk["frame_indices"]) >= min_tracklet_len:
+            if len(trk["frame_indices"]) >= min_tracklet_len and len(trk["embeddings"]) > 0:
                 emb_tensor = torch.tensor(np.stack(trk["embeddings"]))
                 
                 t_data = TrackletData(
@@ -609,7 +705,7 @@ def track_segmentations(
 
     # Loop is complete. Finalize any tracklets that remained active until the very last frame
     for seg_idx, trk in active_tracklets.items():
-        if len(trk["frame_indices"]) >= min_tracklet_len:
+        if len(trk["frame_indices"]) >= min_tracklet_len and len(trk["embeddings"]) > 0:
             emb_tensor = torch.tensor(np.stack(trk["embeddings"]))
             
             t_data = TrackletData(
@@ -643,11 +739,47 @@ def track_segmentations(
 # and take the pth percentile as the distance between the two tracklets.
 # Alternatively, if the tracklets overlap in time, take the distance to be dist_exclusion
 
+def compute_tracklet_distance(
+    config: ReIDConfig,
+    normalized_embs: list[torch.Tensor],
+    tracklet_a_idx: int,
+    tracklet_b_idx: int,
+):
+    emb_i = normalized_embs[tracklet_a_idx]
+    emb_j = normalized_embs[tracklet_b_idx]
+
+    # Cosine similarity matrix between all frame embeddings of tracklet i and tracklet j
+    # Shape: (N_i, N_j)
+    sim_matrix = torch.mm(emb_i, emb_j.t())
+
+    # Clamp to prevent NaN in arccos due to floating point inaccuracies (e.g., 1.0000001)
+    sim_matrix = torch.clamp(sim_matrix, -1.0 + 1e-7, 1.0 - 1e-7)
+
+    # Convert to angular distance scaled to [0, 1]
+    ang_dists = torch.arccos(sim_matrix) / torch.pi
+
+    if config.tracklet_similarity_method == "percentile":
+        # Flatten and take the p-th percentile
+        # np.percentile expects q in [0, 100], so we multiply p by 100
+        dist = float(np.percentile(ang_dists.cpu().numpy(), config.tracklet_similarity_percentile * 100))
+    elif config.tracklet_similarity_method == "chamfer":
+        best_dists_a_to_b, _ = torch.min(ang_dists, dim=1) 
+        best_dists_b_to_a, _ = torch.min(ang_dists, dim=0)
+        all_best_dists = torch.cat([best_dists_a_to_b, best_dists_b_to_a])
+        dist = float(np.percentile(all_best_dists.cpu().numpy(), config.tracklet_similarity_percentile * 100))
+    elif config.tracklet_similarity_method == "top_k_mean":
+        flat_dists = ang_dists.flatten()
+        k = min(config.tracklet_top_k_mean_k, len(flat_dists)) 
+        top_k_dists, _ = torch.topk(flat_dists, k, largest=False)
+        dist = float(torch.mean(top_k_dists).cpu().numpy())
+    else:
+        raise ValueError(f"Unknown tracklet similarity method: {config.tracklet_similarity_method}")
+    return dist
+
 def compute_tracklet_distance_matrix(
+    config: ReIDConfig,
     tracklet_data: list[TrackletData],
     tracklet_metadata: list[TrackletMetadata],
-    dist_exclusion: float = 2.0,
-    p: float = 0.9,
 ) -> tuple[np.ndarray, list[TrackletID]]:
     """
     Compute the distance matrix between all pairs of tracklets.
@@ -674,25 +806,10 @@ def compute_tracklet_distance_matrix(
         for j in range(i + 1, num_tracklets):            
             if scene_ids[i] == scene_ids[j] and not frame_sets[i].isdisjoint(frame_sets[j]):
                 # Temporal exclusion penalty: if they overlap in time, they cannot be the same person
-                dist = dist_exclusion
+                dist = config.exclusion_dist
             else:
-                emb_i = normalized_embs[i]
-                emb_j = normalized_embs[j]
-
-                # Cosine similarity matrix between all frame embeddings of tracklet i and tracklet j
-                # Shape: (N_i, N_j)
-                sim_matrix = torch.mm(emb_i, emb_j.t())
-
-                # Clamp to prevent NaN in arccos due to floating point inaccuracies (e.g., 1.0000001)
-                sim_matrix = torch.clamp(sim_matrix, -1.0 + 1e-7, 1.0 - 1e-7)
-
-                # Convert to angular distance scaled to [0, 1]
-                ang_dists = torch.arccos(sim_matrix) / torch.pi
-
-                # Flatten and take the p-th percentile
-                # np.percentile expects q in [0, 100], so we multiply p by 100
-                dist = float(np.percentile(ang_dists.cpu().numpy(), p * 100))
-
+                dist = compute_tracklet_distance(config, normalized_embs, i, j)
+                
             dist_matrix[i, j] = dist
             dist_matrix[j, i] = dist  # The distance matrix is symmetric
 
@@ -772,7 +889,14 @@ def run_video_reid_pipeline(
     # 1. Split into scenes
     # ---------------------------------------------------------
     print("Splitting video into scenes...")
-    scene_slices, fps = split_video(config.video_path, config.scenes_dir, config.max_scene_len_frames)
+    scene_slices, fps = split_video(
+        config.video_path, 
+        config.scenes_dir, 
+        config.max_scene_len_frames
+    )
+    
+    trim_frames = int(fps * config.scene_trim_seconds)
+    segmentation_trim_frames = int(fps * config.segmentation_trim_seconds)
     
     # Grab video dimensions from the first scene to populate config
     first_scene_path = config.get_scene_path(scene_slices[0].scene_id)
@@ -794,7 +918,8 @@ def run_video_reid_pipeline(
             config=config,
             sam_harness=sam_harness,
             dino_harness=dino_harness,
-            contrastive_head=contrastive_head
+            contrastive_head=contrastive_head,
+            trim_frames=trim_frames
         )
 
         # Track segmentations to form unbroken tracklets
@@ -802,9 +927,12 @@ def run_video_reid_pipeline(
             segmentations=segmentations,
             confidences=confidences,
             contrastive_embeddings=embeddings,
+            min_tracklet_len=config.min_tracklet_len,
             video_width=video_width,
             video_height=video_height,
-            tracklet_start_index=global_tracklet_idx
+            tracklet_start_index=global_tracklet_idx,
+            scene_slice=scene,
+            segmentation_trim_frames=segmentation_trim_frames
         )
 
         # Inject scene context into metadata
@@ -815,22 +943,27 @@ def run_video_reid_pipeline(
         all_tracklets_meta.extend(tracklets_meta)
         global_tracklet_idx += len(tracklets_data)
 
+        # Clear VRAM after every scene chunk
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # ---------------------------------------------------------
     # 4. Build Distance Matrix
     # ---------------------------------------------------------
     print("Computing tracklet distance matrix...")
     distance_matrix, tracklet_ids_order = compute_tracklet_distance_matrix(
+        config=config,
         tracklet_data=all_tracklets_data,
         tracklet_metadata=all_tracklets_meta,
-        dist_exclusion=2.0,  # Ensure epsilon_neg > max possible angular distance
-        p=0.9
+        # dist_exclusion=2.0,  # Ensure epsilon_neg > max possible angular distance
+        # p=0.9
     )
 
     # ---------------------------------------------------------
     # 5. Cluster Tracklets
     # ---------------------------------------------------------
     print("Clustering tracklets to assign Global Person IDs...")
-    similarity_threshold = 0.25  # Cosine similarity margin within which detections are considered the same person
+    similarity_threshold = config.cluster_similarity_threshold  # Cosine similarity margin within which detections are considered the same person
     distance_threshold = np.arccos(similarity_threshold) / np.pi
     tracklet_to_person_id = cluster_tracklets(
         distance_matrix=distance_matrix,
@@ -881,7 +1014,8 @@ def run_video_reid_pipeline(
                 config=config,
                 sam_harness=sam_harness,
                 dino_harness=dino_harness,
-                contrastive_head=contrastive_head
+                contrastive_head=contrastive_head,
+                trim_frames=trim_frames
             )
             
             # Build a mapping of SegmentationIndex -> {color, person_id} for this scene
@@ -944,13 +1078,21 @@ def run_video_reid_pipeline(
 
 if __name__ == "__main__":
     config = ReIDConfig(
-        video_path=Path("/z/dat/person_reid/val/internal/input_videos/classroom/musical_chair_game.mp4"),
-        out_dir=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/musical_chair_game_output"),
+        video_path=Path("/z/dat/person_reid/val/internal/input_videos/classroom/gamebank_1.mp4"),
+        out_dir=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/gamebank_1_output_large_dino_chamfer"),
+        # video_path=Path("/z/dat/person_reid/train/internal/input_videos/classroom/classroom_11.mp4"),
+        # out_dir=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/classroom_11_output_large_dino_chamfer"),
+        # video_path=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/trimmed_test_vid.mp4"),
+        # out_dir=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/trimmed_test_vid_output_large_dino_chamfer"),
+        tracklet_similarity_method="chamfer",
+        apply_mask_for_dino=False,
+        cluster_similarity_threshold=0.0,
+        max_scene_len_frames=400
     )
     sam_harness = SAMHarness("cuda")
     dino_harness = dino_lib.DinoHarness(device="cuda", checkpoint="facebook/dinov3-vitl16-pretrain-lvd1689m")
 
-    head_weights_path = Path("/scratch4/home/adempst/projects/EECS504_Final_Project/checkpoints/New_metrics_large_dino/best_model.pth")
+    head_weights_path = Path("/scratch4/home/adempst/projects/EECS504_Final_Project/checkpoints/Large_Dino_w_Zoom/best_model.pth")
     from train import ReIDTransformerModel
     contrastive_head = ReIDTransformerModel(dino_dim=1024)
     contrastive_head.load_state_dict(torch.load(head_weights_path))

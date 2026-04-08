@@ -12,7 +12,8 @@ from sam3_reid_dataset import (
     VideoSlicePKBatchSampler, 
     reid_collate_fn, 
     DinoDataLoaderWrapper,
-    ApplyBackgroundMask
+    ApplyBackgroundMask,
+    RandomSubjectZoom
 )
 
 st.set_page_config(page_title="Re-ID Dataset Viewer", layout="wide")
@@ -44,6 +45,8 @@ def load_dataloader(root_dir, use_transforms=False, P=4, K=4):
     transform = v2.Compose([
         # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
+
+        v2.RandomApply([RandomSubjectZoom(scale_range=(1.0, 2.0))], p=0.5),
         
         # Slight rotation (±5 degrees), translation (±5%), and scaling (95% to 105%)
         # The mask will perfectly track with these changes.

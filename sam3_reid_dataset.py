@@ -427,6 +427,95 @@ class ApplyBackgroundMask(torch.nn.Module):
             
         return image, mask
 
+class RandomSubjectZoom(torch.nn.Module):
+    """
+    Finds the bounding box of the subject via the mask, randomly determines an amount
+    of surrounding context to include, crops the image/mask, and resizes them back to 
+    the original image size.
+    """
+    def __init__(self, scale_range=(1.0, 4.0)):
+        """
+        Args:
+            scale_range: Tuple of (min_scale, max_scale). 
+                         1.0 = tightest crop around subject (preserving aspect ratio).
+                         Larger values = zooming out to include more background context.
+        """
+        super().__init__()
+        self.scale_range = scale_range
+
+    def forward(self, image, mask):
+        # 1. Get original dimensions to ensure we resize back to these later
+        if image.ndim == 3:
+            C, H, W = image.shape
+        else:
+            H, W = image.shape[-2:]
+            
+        # 2. Extract positive coordinates from the boolean mask
+        coords = torch.nonzero(mask > 0)
+        
+        # Fallback if mask is entirely empty (no subject found)
+        if coords.numel() == 0:
+            return image, mask
+            
+        # Handle differing tensor dimension depths gracefully (C, H, W) vs (H, W)
+        if mask.ndim >= 3: 
+            y_coords, x_coords = coords[:, -2], coords[:, -1]
+        else:
+            y_coords, x_coords = coords[:, 0], coords[:, 1]
+            
+        # 3. Find raw subject bounding box & center
+        y_min, y_max = y_coords.min().item(), y_coords.max().item()
+        x_min, x_max = x_coords.min().item(), x_coords.max().item()
+        
+        subject_w = max(x_max - x_min, 1)
+        subject_h = max(y_max - y_min, 1)
+        center_x = x_min + subject_w / 2.0
+        center_y = y_min + subject_h / 2.0
+        
+        # 4. Determine base crop size while FORCING the original image's aspect ratio.
+        # This guarantees that when we resize later, the person doesn't get stretched.
+        aspect_ratio = W / H
+        base_crop_w = max(subject_w, subject_h * aspect_ratio)
+        base_crop_h = base_crop_w / aspect_ratio
+        
+        # 5. Determine the actual random zoom/scale factor
+        # The maximum possible scale before we hit the absolute edges of the image
+        max_possible_scale = W / base_crop_w 
+        
+        # If the subject is basically taking up the whole image already, skip
+        if max_possible_scale <= 1.0:
+            return image, mask
+            
+        min_s, max_s = self.scale_range
+        # Cap the max scale so we never try to crop a box larger than the image itself
+        max_s = min(max_s, max_possible_scale) 
+        min_s = min(min_s, max_s)
+        
+        chosen_scale = random.uniform(min_s, max_s)
+        
+        crop_w = int(base_crop_w * chosen_scale)
+        crop_h = int(base_crop_h * chosen_scale)
+        
+        # 6. Calculate top-left coordinates
+        left = int(center_x - crop_w / 2.0)
+        top = int(center_y - crop_h / 2.0)
+        
+        # Shift the crop box back inwards if it bled off the edges of the image
+        left = max(0, min(left, W - crop_w))
+        top = max(0, min(top, H - crop_h))
+        
+        # 7. Perform the crop 
+        # (v2.functional respects tv_tensors metadata underneath)
+        image_cropped = v2.functional.crop(image, top=top, left=left, height=crop_h, width=crop_w)
+        mask_cropped = v2.functional.crop(mask, top=top, left=left, height=crop_h, width=crop_w)
+        
+        # 8. Resize back to original size so torch.stack operates smoothly on uniform batches
+        image_out = v2.functional.resize(image_cropped, size=[H, W], antialias=True)
+        # CRITICAL: Use NEAREST_EXACT for the mask so boolean 0/1 values aren't blurred into 0.5s
+        mask_out = v2.functional.resize(mask_cropped, size=[H, W], interpolation=v2.InterpolationMode.NEAREST_EXACT)
+        
+        return image_out, mask_out
+
 if __name__ == "__main__":
     import dotenv
     dotenv.load_dotenv()
@@ -434,12 +523,13 @@ if __name__ == "__main__":
     # 1. Define typical Re-ID transformations
     # Using torchvision.transforms.v2 to sync spatial transforms across image and mask
     transform = v2.Compose([
-    # --- 1. Safe Spatial Transforms ---
+        # --- 1. Safe Spatial Transforms ---
         v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomApply([RandomSubjectZoom(scale_range=(1.0, 4.0))], p=0.5),
         
         # Slight rotation (5 degrees), translation (5%), and scaling (95% to 105%)
         # The mask will perfectly track with these changes.
-        v2.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+        v2.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.8, 1.2)),
 
         # --- 2. Color and Lighting (Photometric) ---
         v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
