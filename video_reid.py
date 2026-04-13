@@ -15,6 +15,11 @@ from scipy.cluster.hierarchy import linkage, fcluster
 import h5py
 from typing import Literal
 
+import umap
+from sklearn.decomposition import PCA
+from scipy.cluster.hierarchy import dendrogram
+import matplotlib.patches as mpatches
+
 import dino_lib
 
 SEG_ID_TYPE = np.int32
@@ -153,6 +158,27 @@ def split_video(video_path: Path, out_dir: Path, max_len_frames: int) -> tuple[l
         
     fps = cap.get(cv2.CAP_PROP_FPS)
     
+    # # 2. Constrain scene lengths and build SceneSlice objects
+    # for scene in scenes:
+    #     # TransNetV2 returns inclusive start and end frames
+    #     true_scene_start = scene['start_frame']
+    #     # Convert to exclusive end_frame for our dataclass
+    #     true_scene_end = scene['end_frame'] + 1 
+        
+    #     current_start = true_scene_start
+    #     while current_start < true_scene_end:
+    #         current_end = min(current_start + max_len_frames, true_scene_end)
+            
+    #         scene_id = f"s{current_start:06d}_e{current_end:06d}"
+    #         scene_slices.append(SceneSlice(
+    #             scene_id=scene_id,
+    #             start_frame=current_start,
+    #             end_frame=current_end,
+    #             transnet_scene_start=true_scene_start,
+    #             transnet_scene_end=true_scene_end
+    #         ))
+    #         current_start = current_end
+
     # 2. Constrain scene lengths and build SceneSlice objects
     for scene in scenes:
         # TransNetV2 returns inclusive start and end frames
@@ -160,9 +186,22 @@ def split_video(video_path: Path, out_dir: Path, max_len_frames: int) -> tuple[l
         # Convert to exclusive end_frame for our dataclass
         true_scene_end = scene['end_frame'] + 1 
         
+        scene_length = true_scene_end - true_scene_start
+        if scene_length <= 0:
+            continue
+            
+        # Calculate the minimum number of chunks required to satisfy max_len_frames
+        num_chunks = (scene_length + max_len_frames - 1) // max_len_frames
+        
+        # Determine the base length for each chunk and how many chunks need +1 frame
+        base_len = scene_length // num_chunks
+        remainder = scene_length % num_chunks
+        
         current_start = true_scene_start
-        while current_start < true_scene_end:
-            current_end = min(current_start + max_len_frames, true_scene_end)
+        for i in range(num_chunks):
+            # Distribute the remainder across the first 'remainder' chunks
+            chunk_len = base_len + 1 if i < remainder else base_len
+            current_end = current_start + chunk_len
             
             scene_id = f"s{current_start:06d}_e{current_end:06d}"
             scene_slices.append(SceneSlice(
@@ -739,80 +778,195 @@ def track_segmentations(
 # and take the pth percentile as the distance between the two tracklets.
 # Alternatively, if the tracklets overlap in time, take the distance to be dist_exclusion
 
-def compute_tracklet_distance(
-    config: ReIDConfig,
-    normalized_embs: list[torch.Tensor],
-    tracklet_a_idx: int,
-    tracklet_b_idx: int,
-):
-    emb_i = normalized_embs[tracklet_a_idx]
-    emb_j = normalized_embs[tracklet_b_idx]
+# def compute_tracklet_distance(config, normalized_embs, tracklet_a_idx, tracklet_b_idx):
+#     emb_i = normalized_embs[tracklet_a_idx]
+#     emb_j = normalized_embs[tracklet_b_idx]
 
-    # Cosine similarity matrix between all frame embeddings of tracklet i and tracklet j
-    # Shape: (N_i, N_j)
-    sim_matrix = torch.mm(emb_i, emb_j.t())
+#     sim_matrix = torch.mm(emb_i, emb_j.t())
+#     sim_matrix = torch.clamp(sim_matrix, -1.0 + 1e-7, 1.0 - 1e-7)
+#     ang_dists = torch.arccos(sim_matrix) / torch.pi
 
-    # Clamp to prevent NaN in arccos due to floating point inaccuracies (e.g., 1.0000001)
-    sim_matrix = torch.clamp(sim_matrix, -1.0 + 1e-7, 1.0 - 1e-7)
+#     if config.tracklet_similarity_method == "percentile":
+#         dist = torch.quantile(ang_dists.flatten(), config.tracklet_similarity_percentile).item()
+#     elif config.tracklet_similarity_method == "chamfer":
+#         best_dists_a_to_b, _ = torch.min(ang_dists, dim=1) 
+#         best_dists_b_to_a, _ = torch.min(ang_dists, dim=0)
+#         all_best_dists = torch.cat([best_dists_a_to_b, best_dists_b_to_a])
+#         dist = torch.quantile(all_best_dists, config.tracklet_similarity_percentile).item()
+#     elif config.tracklet_similarity_method == "top_k_mean":
+#         flat_dists = ang_dists.flatten()
+#         k = min(config.tracklet_top_k_mean_k, len(flat_dists)) 
+#         top_k_dists, _ = torch.topk(flat_dists, k, largest=False)
+#         dist = torch.mean(top_k_dists).item() # .item() extracts the float without pulling the whole tensor
+#     else:
+#         raise ValueError(f"Unknown tracklet similarity method: {config.tracklet_similarity_method}")
+    
+#     return dist
 
-    # Convert to angular distance scaled to [0, 1]
-    ang_dists = torch.arccos(sim_matrix) / torch.pi
+# def compute_tracklet_distance_matrix(
+#     config: ReIDConfig,
+#     tracklet_data: list[TrackletData],
+#     tracklet_metadata: list[TrackletMetadata],
+# ) -> tuple[np.ndarray, list[TrackletID]]:
+#     """
+#     Compute the distance matrix between all pairs of tracklets.
+#     Returns the distance matrix and a list of tracklet ids corresponding to the rows/columns.
+#     """
+#     num_tracklets = len(tracklet_data)
+#     dist_matrix = np.zeros((num_tracklets, num_tracklets), dtype=np.float32)
+#     tracklet_ids = [t.tracklet_id for t in tracklet_data]
 
-    if config.tracklet_similarity_method == "percentile":
-        # Flatten and take the p-th percentile
-        # np.percentile expects q in [0, 100], so we multiply p by 100
-        dist = float(np.percentile(ang_dists.cpu().numpy(), config.tracklet_similarity_percentile * 100))
-    elif config.tracklet_similarity_method == "chamfer":
-        best_dists_a_to_b, _ = torch.min(ang_dists, dim=1) 
-        best_dists_b_to_a, _ = torch.min(ang_dists, dim=0)
-        all_best_dists = torch.cat([best_dists_a_to_b, best_dists_b_to_a])
-        dist = float(np.percentile(all_best_dists.cpu().numpy(), config.tracklet_similarity_percentile * 100))
-    elif config.tracklet_similarity_method == "top_k_mean":
-        flat_dists = ang_dists.flatten()
-        k = min(config.tracklet_top_k_mean_k, len(flat_dists)) 
-        top_k_dists, _ = torch.topk(flat_dists, k, largest=False)
-        dist = float(torch.mean(top_k_dists).cpu().numpy())
-    else:
-        raise ValueError(f"Unknown tracklet similarity method: {config.tracklet_similarity_method}")
-    return dist
+#     # 1. Pre-normalize embeddings for fast cosine similarity via dot product
+#     normalized_embs = []
+#     for t in tracklet_data:
+#         embs = t.embeddings.float() 
+#         # Normalize along the contrastive_embedding_dim
+#         norm_embs = torch.nn.functional.normalize(embs, p=2, dim=1)
+#         normalized_embs.append(norm_embs)
 
+#     # 2. Pre-compute frame index sets for faster temporal overlap checking
+#     frame_sets = [set(t_data.frame_indices) for t_data in tracklet_data]
+#     scene_ids = [t_meta.scene_id for t_meta in tracklet_metadata]
+
+#     # 3. Compute pairwise distances
+#     num_comparisons = num_tracklets * (num_tracklets - 1) / 2
+#     print(f"Computing distance matrix for {num_tracklets} tracklets ({num_comparisons} comparisons)...")
+#     progress_bar = tqdm(total=num_comparisons, desc="Computing distance matrix")
+#     for i in range(num_tracklets):
+#         for j in range(i + 1, num_tracklets):            
+#             progress_bar.set_description(f"Computing distance matrix for tracklet {i} and {j}")
+#             if scene_ids[i] == scene_ids[j] and not frame_sets[i].isdisjoint(frame_sets[j]):
+#                 # Temporal exclusion penalty: if they overlap in time, they cannot be the same person
+#                 dist = config.exclusion_dist
+#             else:
+#                 dist = compute_tracklet_distance(config, normalized_embs, i, j)
+                
+#             dist_matrix[i, j] = dist
+#             dist_matrix[j, i] = dist  # The distance matrix is symmetric
+#             progress_bar.update(1)
+
+#     progress_bar.close()
+#     return dist_matrix, tracklet_ids
+
+@torch.no_grad()
 def compute_tracklet_distance_matrix(
-    config: ReIDConfig,
-    tracklet_data: list[TrackletData],
-    tracklet_metadata: list[TrackletMetadata],
-) -> tuple[np.ndarray, list[TrackletID]]:
-    """
-    Compute the distance matrix between all pairs of tracklets.
-    Returns the distance matrix and a list of tracklet ids corresponding to the rows/columns.
-    """
+    config, # ReIDConfig
+    tracklet_data, # list[TrackletData]
+    tracklet_metadata, # list[TrackletMetadata]
+) -> tuple[np.ndarray, list]:
+    
     num_tracklets = len(tracklet_data)
-    dist_matrix = np.zeros((num_tracklets, num_tracklets), dtype=np.float32)
     tracklet_ids = [t.tracklet_id for t in tracklet_data]
+    dist_matrix = np.zeros((num_tracklets, num_tracklets), dtype=np.float32)
 
-    # 1. Pre-normalize embeddings for fast cosine similarity via dot product
-    normalized_embs = []
-    for t in tracklet_data:
-        embs = t.embeddings.float() 
-        # Normalize along the contrastive_embedding_dim
-        norm_embs = torch.nn.functional.normalize(embs, p=2, dim=1)
-        normalized_embs.append(norm_embs)
+    if num_tracklets <= 1:
+        return dist_matrix, tracklet_ids
 
-    # 2. Pre-compute frame index sets for faster temporal overlap checking
+    device = tracklet_data[0].embeddings.device
+    dtype = tracklet_data[0].embeddings.dtype
+    embed_dim = tracklet_data[0].embeddings.shape[1]
+
+    # 1. Pre-normalize & extract lengths
+    normalized_embs = [
+        torch.nn.functional.normalize(t.embeddings.float(), p=2, dim=1) 
+        for t in tracklet_data
+    ]
+    lengths = torch.tensor([len(e) for e in normalized_embs], device=device)
+    max_len = lengths.max().item()
+
+    # 2. Create padded tensor for batched processing
+    # Shape: (N, max_len, embed_dim)
+    padded_embs = torch.zeros((num_tracklets, max_len, embed_dim), dtype=dtype, device=device)
+    valid_mask = torch.zeros((num_tracklets, max_len), dtype=torch.bool, device=device)
+    
+    for i, emb in enumerate(normalized_embs):
+        padded_embs[i, :lengths[i]] = emb
+        valid_mask[i, :lengths[i]] = True
+
+    # 3. Pre-compute temporal exclusion mask in pure Python/Numpy (very fast)
     frame_sets = [set(t_data.frame_indices) for t_data in tracklet_data]
     scene_ids = [t_meta.scene_id for t_meta in tracklet_metadata]
-
-    # 3. Compute pairwise distances
+    exclusion_mask = np.zeros((num_tracklets, num_tracklets), dtype=bool)
+    
     for i in range(num_tracklets):
-        for j in range(i + 1, num_tracklets):            
+        for j in range(i + 1, num_tracklets):
             if scene_ids[i] == scene_ids[j] and not frame_sets[i].isdisjoint(frame_sets[j]):
-                # Temporal exclusion penalty: if they overlap in time, they cannot be the same person
-                dist = config.exclusion_dist
-            else:
-                dist = compute_tracklet_distance(config, normalized_embs, i, j)
-                
-            dist_matrix[i, j] = dist
-            dist_matrix[j, i] = dist  # The distance matrix is symmetric
+                exclusion_mask[i, j] = True
+                exclusion_mask[j, i] = True
 
+    # 4. Compute batched distances row-by-row
+    print(f"Computing distance matrix for {num_tracklets} tracklets...")
+    progress_bar = tqdm(total=num_tracklets - 1, desc="Computing batched distances")
+
+    for i in range(num_tracklets - 1):
+        j_start = i + 1
+        num_j = num_tracklets - j_start
+        
+        emb_i = normalized_embs[i] # Shape: (len_i, embed_dim)
+        len_i = lengths[i].item()
+        
+        # Sliced targets (all tracklets after i)
+        padded_j = padded_embs[j_start:] # Shape: (num_j, max_len, embed_dim)
+        mask_j = valid_mask[j_start:]    # Shape: (num_j, max_len)
+
+        # Einsum computes dot product between every frame of i and every padded frame of all j
+        # Result shape: (num_j, len_i, max_len)
+        sim = torch.einsum('id, njd -> nij', emb_i, padded_j)
+        sim = torch.clamp(sim, -1.0 + 1e-7, 1.0 - 1e-7)
+        ang_dists = torch.arccos(sim) / torch.pi
+
+        # Create an invalid mask for padded positions to exclude them from aggregations
+        invalid_mask = ~mask_j.unsqueeze(1).expand(num_j, len_i, max_len)
+
+        # --- Vectorized Aggregations ---
+        if config.tracklet_similarity_method == "percentile":
+            # Fill invalid frames with NaN, then flatten and use nanquantile
+            ang_dists_nan = ang_dists.masked_fill(invalid_mask, float('nan'))
+            flat_dists = ang_dists_nan.reshape(num_j, -1)
+            dists = torch.nanquantile(flat_dists, config.tracklet_similarity_percentile, dim=1)
+
+        elif config.tracklet_similarity_method == "chamfer":
+            # Fill invalid frames with INF so they aren't picked by min()
+            ang_dists_inf = ang_dists.masked_fill(invalid_mask, float('inf'))
+            best_a_to_b, _ = torch.min(ang_dists_inf, dim=2) # Shape: (num_j, len_i)
+            best_b_to_a, _ = torch.min(ang_dists_inf, dim=1) # Shape: (num_j, max_len)
+            
+            # Revert INF back to NaN for nanquantile calculation
+            best_a_nan = best_a_to_b.masked_fill(best_a_to_b == float('inf'), float('nan'))
+            best_b_nan = best_b_to_a.masked_fill(best_b_to_a == float('inf'), float('nan'))
+            
+            all_best = torch.cat([best_a_nan, best_b_nan], dim=1) # Shape: (num_j, len_i + max_len)
+            dists = torch.nanquantile(all_best, config.tracklet_similarity_percentile, dim=1)
+
+        elif config.tracklet_similarity_method == "top_k_mean":
+            ang_dists_inf = ang_dists.masked_fill(invalid_mask, float('inf'))
+            flat_dists = ang_dists_inf.reshape(num_j, -1)
+            
+            k = config.tracklet_top_k_mean_k
+            # Protect against cases where k is larger than the maximum possible valid pairs
+            k_safe = min(k, len_i * max_len) 
+            
+            top_k_dists, _ = torch.topk(flat_dists, k_safe, largest=False, dim=1)
+            top_k_nan = top_k_dists.masked_fill(top_k_dists == float('inf'), float('nan'))
+            dists = torch.nanmean(top_k_nan, dim=1)
+            
+        else:
+            raise ValueError(f"Unknown tracklet similarity method: {config.tracklet_similarity_method}")
+
+        # 5. Bring aggregated vector back to CPU/numpy
+        dists_np = dists.cpu().numpy()
+
+        # 6. Apply pre-computed exclusions
+        excl = exclusion_mask[i, j_start:]
+        dists_np[excl] = config.exclusion_dist
+
+        # 7. Write directly to symmetric distance matrix
+        dist_matrix[i, j_start:] = dists_np
+        dist_matrix[j_start:, i] = dists_np
+        
+        progress_bar.update(1)
+
+    progress_bar.close()
     return dist_matrix, tracklet_ids
 
 
@@ -955,8 +1109,6 @@ def run_video_reid_pipeline(
         config=config,
         tracklet_data=all_tracklets_data,
         tracklet_metadata=all_tracklets_meta,
-        # dist_exclusion=2.0,  # Ensure epsilon_neg > max possible angular distance
-        # p=0.9
     )
 
     # ---------------------------------------------------------
@@ -1085,9 +1237,10 @@ if __name__ == "__main__":
         # video_path=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/trimmed_test_vid.mp4"),
         # out_dir=Path("/scratch4/home/adempst/projects/EECS504_Final_Project/data/trimmed_test_vid_output_large_dino_chamfer"),
         tracklet_similarity_method="chamfer",
+        tracklet_chamfer_percentile=0.1,
         apply_mask_for_dino=False,
         cluster_similarity_threshold=0.0,
-        max_scene_len_frames=400
+        max_scene_len_frames=600
     )
     sam_harness = SAMHarness("cuda")
     dino_harness = dino_lib.DinoHarness(device="cuda", checkpoint="facebook/dinov3-vitl16-pretrain-lvd1689m")
