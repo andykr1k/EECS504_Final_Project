@@ -60,8 +60,9 @@ def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5,
     
     # Load Segmentation Mask
     try:
-        seg_data = np.load(str(segmentation_path))
-        segmentation = seg_data['segmentation']
+        # seg_data = np.load(str(segmentation_path))
+        # segmentation = seg_data['segmentation']
+        segmentation = cv2.imread(str(segmentation_path), cv2.IMREAD_UNCHANGED)
     except Exception as e:
         st.error(f"Error loading segmentation data: {e}")
         return img
@@ -70,6 +71,8 @@ def overlay_masks(image_path: Path, segmentation_path: Path, alpha: float = 0.5,
     
     # Get unique person IDs in this frame
     unique_ids = np.unique(segmentation)
+    # Remove 255 from unique ids
+    unique_ids = unique_ids[unique_ids != 255]
     
     # Colorize the overlay
     for uid in unique_ids:
@@ -143,7 +146,7 @@ st.title("Person Re-ID Dataset Viewer")
 st.sidebar.header("Dataset Navigation")
 
 # 1. Root Directory Input
-default_root = "/z/dat/person_reid/internal/input_videos"
+default_root = "/z/dat/person_reid/train"
 dataset_root = st.sidebar.text_input("Dataset Root Directory", default_root)
 
 segmentation_dirs = get_segmentation_dirs(dataset_root)
@@ -192,7 +195,7 @@ st.subheader(f"Slice: `{selected_slice_name}` | Frame: `{selected_frame_idx}`")
 # Construct file paths
 stem = selected_slice_name
 frame_path = selected_slice_dir / f"{stem}_{selected_frame_idx}_frame.png"
-seg_path = selected_slice_dir / f"{stem}_{selected_frame_idx}_segmentation.npz"
+seg_path = selected_slice_dir / f"{stem}_{selected_frame_idx}_segmentation.png"
 sidecar_path = selected_slice_dir / f"{stem}_{selected_frame_idx}_sidecar.json"
 
 # Check if all files exist

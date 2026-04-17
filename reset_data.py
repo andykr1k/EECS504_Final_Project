@@ -85,4 +85,6 @@ if __name__ == "__main__":
     use_parallel = True
     dry_run = False
     
-    main("/z/dat/person_reid/internal/input_videos", remove_segmentations, remove_preprocessed_slices, use_parallel, dry_run)
+    # main("/z/dat/person_reid/train/internal/input_videos", remove_segmentations, remove_preprocessed_slices, use_parallel, dry_run)
+    # main("/z/dat/person_reid/val/internal/input_videos", remove_segmentations, remove_preprocessed_slices, use_parallel, dry_run)
+    main("/z/dat/person_reid/train/person_reid_in_the_wild", remove_segmentations, remove_preprocessed_slices, use_parallel, dry_run)

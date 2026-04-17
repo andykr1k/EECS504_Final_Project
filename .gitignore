@@ -1,5 +1,8 @@
 data/
 nohup.out
+checkpoints/
+wandb/
+*.prof
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

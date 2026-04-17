@@ -20,6 +20,9 @@ https://github.com/NEU-Gou/awesome-reid-dataset?tab=readme-ov-file#msmt17
 mars: This is another good dataset. Maybe a bit easier to deal with than msmt17 as well.
 https://github.com/NEU-Gou/awesome-reid-dataset?tab=readme-ov-file#mars
 
+PRW: This is probably the best actually. It is like our task where we have a full picture instead of a cropped bounding box of the person.
+https://www.kaggle.com/datasets/edoardomerli/prw-person-re-identification-in-the-wild
+
 We should preprocess these existing datasets to our format so that it can be loaded with the same dataloader.
 To fit it into the same format, we have one video folder per person. Inside that folder we only have segmentations for that individual. Then negatives will only be "cross-video" since there are no in-video negatives like there are with our automatically generated dataset.
 This will naturally cause the dataloader to sample negatives from other individuals.
@@ -61,6 +64,66 @@ We ingest the dataset and use contrastive losses (circle loss probably) to train
 
 #### *Deliverable:*
 Torch model wrapped in a class for easy inference. Should have an `embed` method that takes a PIL image and numpy bool array for the segmentation and returns the embedding.
+
+#### *Example Usage:*
+Base for training:
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type mlp \
+  --pool_type attention \
+  --proj_type identity
+```
+or
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type mlp \
+  --pool_type average \
+  --proj_type identity
+```
+
+Train using a larger dino model:
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type mlp \
+  --pool_type attention \
+  --proj_type identity \
+  --dino_checkpoint "facebook/dinov3-vitl16-pretrain-lvd1689m" \
+  --dino_dim 1024
+```
+
+Train using a transformer:
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type transformer
+```
+
+Train using a transformer with a larger dino model:
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type transformer \
+  --dino_checkpoint "facebook/dinov3-vitl16-pretrain-lvd1689m" \
+  --dino_dim 1024 \
+  --train_max_batches 500
+```
+```
+python train.py \
+  --train_dir "/z/dat/person_reid/train" \
+  --val_dir "/z/dat/person_reid/val" \
+  --model_type transformer \
+  --dino_checkpoint "facebook/dinov3-vith16plus-pretrain-lvd1689m" \
+  --dino_dim 1280 \
+  --train_max_batches 500
+```
 
 ### Inference:
 **Clustering**: Assigning unique IDs to each segment.
